@@ -1,0 +1,669 @@
+/**
+ * The HTTP surface.
+ *
+ * Plain `node:http`, as the template is, and for the reason the template gives: the parts that
+ * matter here — request ids, RED metrics, the child logger, the error shape, the auth-fault
+ * mapping — are framework-independent.
+ *
+ * Rule 4 of docs/ecosystem/03 §2: `/livez`, `/readyz` and `/metrics` on every service, or it does
+ * not pass CI.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * **`POST /v1/brand-kits/:id/generate` ANSWERS 202. IT REACHES NO MODEL.**
+ *
+ * The handler resolves the kit, builds the spec and the prompt, reserves the credit, writes one
+ * row and enqueues. A FLUX call takes 20 to 40 seconds, which is longer than a rolling deploy
+ * waits and longer than several proxies will hold a connection; doing it inside the request would
+ * mean the money leaves and the record of what it bought does not arrive. `mint` records the same
+ * decision for the same reason, in stronger terms, at the top of its own server.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ *
+ * The one decision that is easy to get backwards is the auth-fault mapping. A bad token is 401. A
+ * verifier that could not reach the JWKS is **503**, never 401 — answering 401 there signs every
+ * user in the estate out because identity is having a bad minute.
+ *
+ * The second is `402`. An account over its credit cap is not a 500 and not a 403: the cap decided,
+ * the answer is correct, and the client's remedy is to raise the cap or wait. A 403 would send a
+ * user to check their permissions and a 500 would send an engineer to check the logs.
+ */
+
+import {
+  createServer as createHttpServer,
+  type IncomingMessage,
+  type Server,
+  type ServerResponse,
+} from 'node:http'
+import {
+  ForbiddenError,
+  TokenError,
+  bearerFrom,
+  isAdmin,
+  requireScope,
+  statusFor,
+  subjectUserId,
+  type Principal,
+} from '@cloudsforge/auth'
+import type { Lifecycle } from '@cloudsforge/lifecycle'
+import { Metrics, newRequestId, type Logger } from '@cloudsforge/telemetry'
+import { ACCENT_PATTERN, BrandKitConflictError, type BrandKit, type BrandKitStore } from './brandkits.ts'
+import { CreditCapError, usd } from './credits.ts'
+import { SpecError, specFor } from './specs.ts'
+import { isBackendChoice, type BackendChoice } from './backend.ts'
+import { provenanceOf, type GenerationJob, type RequestGenerationInput } from './generation.ts'
+import type { Preflight } from './preflight.ts'
+import type { Asset } from './assets.ts'
+
+/** The verifier as this file needs it. An interface, so a test does not need a JWKS. */
+export interface PrincipalVerifier {
+  principal(token: string): Promise<Principal>
+}
+
+/** Reads this service performs. Injected as functions so a route can be tested without a pool. */
+export interface ReadModel {
+  findJob(id: string): Promise<GenerationJob | null>
+  findAsset(id: string): Promise<Asset | null>
+}
+
+/**
+ * Accepting a generation, as this file needs it.
+ *
+ * A port rather than the pipeline's own `RequestDeps`, for the same reason the widget store in the
+ * template is an interface: **a route may not reach the pool.** It also means the 402 mapping can
+ * be tested by injecting a refusal, rather than by arranging a real over-cap account and hoping
+ * the mapping is reached.
+ */
+export interface GenerationRequester {
+  request(input: RequestGenerationInput): Promise<GenerationJob>
+}
+
+export interface ServerDeps {
+  readonly lifecycle: Lifecycle
+  readonly logger: Logger
+  readonly metrics: Metrics
+  readonly verifier: PrincipalVerifier
+  readonly kits: BrandKitStore
+  readonly reads: ReadModel
+  readonly generation: GenerationRequester
+  readonly preflight: Preflight
+  readonly beforeScrape?: () => Promise<void>
+}
+
+export const READ_SCOPE = 'studio:read'
+export const WRITE_SCOPE = 'studio:write'
+
+/**
+ * Domain metrics, declared rather than inferred from a log line.
+ *
+ * The alternative — grepping logs for a message — makes a metric that breaks when someone rewords
+ * the message, and it cannot be a Prometheus counter with labels. AD-20.
+ */
+export function registerServiceMetrics(metrics: Metrics): Metrics {
+  return metrics
+    .register({
+      name: 'studio_brand_kits_created_total',
+      help: 'Brand kits created',
+      kind: 'counter',
+      labels: ['actor_kind'],
+    })
+    .register({
+      name: 'studio_generations_requested_total',
+      help: 'Generation jobs accepted',
+      kind: 'counter',
+      labels: ['kind', 'backend_choice'],
+    })
+    .register({
+      name: 'studio_generations_refused_total',
+      help: 'Generation requests refused before any image call',
+      kind: 'counter',
+      labels: ['reason'],
+    })
+}
+
+/**
+ * An inbound request id is trusted only if it is safe to put in a log line and echo in a header.
+ * Anything else is replaced rather than rejected — the caller does not need a 400 over this, and
+ * an unvalidated value here is a header-injection and a log-forgery primitive at once.
+ */
+const SAFE_REQUEST_ID = /^[A-Za-z0-9_-]{1,64}$/
+
+const MAX_BODY_BYTES = 64 * 1024
+const MAX_STYLE_PROMPT = 2_000
+const MAX_PALETTE = 12
+
+interface Reply {
+  readonly status: number
+  readonly body?: unknown
+  readonly text?: string
+  readonly contentType?: string
+  readonly headers?: Record<string, string>
+}
+
+interface RequestContext {
+  readonly req: IncomingMessage
+  readonly url: URL
+  readonly requestId: string
+  readonly log: Logger
+  readonly params: Record<string, string>
+}
+
+interface Route {
+  readonly method: string
+  readonly path: string
+  readonly pattern: RegExp
+  readonly handle: (ctx: RequestContext, deps: ServerDeps) => Promise<Reply>
+}
+
+/**
+ * Compile `/v1/brand-kits/:id/generate` into a matcher. The segment pattern excludes `/` so a
+ * parameter cannot swallow the rest of the path and make one route answer for another.
+ */
+function compile(path: string): RegExp {
+  const source = path
+    .split('/')
+    .map((segment) =>
+      segment.startsWith(':')
+        ? `(?<${segment.slice(1)}>[^/]+)`
+        : segment.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'),
+    )
+    .join('/')
+  return new RegExp(`^${source}$`)
+}
+
+class BadRequestError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'BadRequestError'
+  }
+}
+
+class NotFoundError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'NotFoundError'
+  }
+}
+
+export function createServer(deps: ServerDeps): Server {
+  const routes = buildRoutes()
+  let inFlight = 0
+
+  return createHttpServer((req, res) => {
+    const startedAt = process.hrtime.bigint()
+    const presented = headerOf(req, 'x-request-id')
+    const requestId = presented && SAFE_REQUEST_ID.test(presented) ? presented : newRequestId()
+
+    // Echoed before anything can fail, so even a 500 carries the id the user will quote.
+    res.setHeader('x-request-id', requestId)
+
+    const url = new URL(req.url ?? '/', `http://${headerOf(req, 'host') ?? 'localhost'}`)
+    const method = req.method ?? 'GET'
+
+    let matched: Route | undefined
+    let params: Record<string, string> = {}
+    for (const route of routes) {
+      if (route.method !== method) continue
+      const match = route.pattern.exec(url.pathname)
+      if (match) {
+        matched = route
+        params = { ...match.groups }
+        break
+      }
+    }
+
+    // Unmatched paths collapse to one label. Using the raw path would let any caller mint
+    // unbounded time series and take the scrape target down with cardinality.
+    const routeLabel = matched ? matched.path : 'unmatched'
+    const log = deps.logger.child({ requestId, method, route: routeLabel })
+
+    inFlight += 1
+    deps.metrics.set('http_requests_in_flight', inFlight)
+
+    const finish = (status: number) => {
+      inFlight -= 1
+      deps.metrics.set('http_requests_in_flight', inFlight)
+      const durationMs = Number(process.hrtime.bigint() - startedAt) / 1e6
+      deps.metrics.increment('http_requests_total', { method, route: routeLabel, status: String(status) })
+      deps.metrics.observe('http_request_duration_ms', durationMs, { method, route: routeLabel })
+    }
+
+    void handle(matched, { req, url, requestId, log, params }, deps)
+      .then((reply) => {
+        send(res, reply, requestId)
+        finish(reply.status)
+      })
+      .catch((err: unknown) => {
+        // Reaching here means the error mapping itself failed. Answer, then say so loudly.
+        log.error('request handler threw after mapping', { err })
+        send(res, errorReply(500, 'internal', 'the request could not be completed', requestId), requestId)
+        finish(500)
+      })
+  })
+}
+
+/**
+ * Map every failure onto a status, grouped by what the caller should do about it.
+ *
+ *   * **400** — the request could not be a legal generation. Fix it; retrying will not help.
+ *   * **402** — the account is over its credit cap. The cap decided, and this is an answer, not
+ *     an error. **No image call was made.**
+ *   * **403** — a scope or a role.
+ *   * **404** — something named does not exist, or belongs to somebody else. The two are the same
+ *     answer on purpose: a distinct 403 for "exists but is not yours" is an enumeration oracle.
+ *   * **409** — well formed, but a kit of that name already exists for this owner.
+ *   * **503** — the token verifier could not be reached.
+ */
+async function handle(route: Route | undefined, ctx: RequestContext, deps: ServerDeps): Promise<Reply> {
+  if (!route) {
+    return errorReply(404, 'not_found', `no route for ${ctx.req.method} ${ctx.url.pathname}`, ctx.requestId)
+  }
+  try {
+    return await route.handle(ctx, deps)
+  } catch (err) {
+    const authStatus = statusFor(err)
+    if (authStatus === 401) {
+      // The reason is logged, never returned — "signature verification failed" versus "expired"
+      // tells an attacker which half of a forged token to fix.
+      ctx.log.info('unauthenticated request', { err })
+      return errorReply(401, 'unauthenticated', 'a valid bearer token is required', ctx.requestId)
+    }
+    if (authStatus === 403) {
+      const required = err instanceof ForbiddenError ? err.required : 'unknown'
+      ctx.log.info('forbidden request', { required })
+      return errorReply(403, 'forbidden', `missing required authority: ${required}`, ctx.requestId)
+    }
+    if (authStatus === 503) {
+      ctx.log.error('token verifier unavailable', { err })
+      return errorReply(503, 'verifier_unavailable', 'authentication is temporarily unavailable', ctx.requestId)
+    }
+    if (err instanceof CreditCapError) {
+      deps.metrics.increment('studio_generations_refused_total', { reason: 'credit_cap' })
+      ctx.log.info('generation refused by the credit cap before any image call', {
+        remaining: usd(err.remainingUsdMicros),
+      })
+      return {
+        status: 402,
+        body: {
+          error: {
+            code: 'credit_cap_exceeded',
+            message: err.message,
+            requestId: ctx.requestId,
+            capUsd: usd(err.capUsdMicros),
+            remainingUsd: usd(err.remainingUsdMicros),
+            requestedUsd: usd(err.requestedUsdMicros),
+            // Stated in the response because it is the fact a caller most needs and cannot
+            // otherwise know: being refused did not cost them anything.
+            imageCallMade: false,
+          },
+        },
+      }
+    }
+    if (err instanceof BrandKitConflictError) {
+      return errorReply(409, 'brand_kit_exists', err.message, ctx.requestId)
+    }
+    if (err instanceof NotFoundError) {
+      return errorReply(404, 'not_found', err.message, ctx.requestId)
+    }
+    if (err instanceof SpecError || err instanceof BadRequestError) {
+      return errorReply(400, 'bad_request', err.message, ctx.requestId)
+    }
+    ctx.log.error('unhandled request failure', { err })
+    return errorReply(500, 'internal', 'the request could not be completed', ctx.requestId)
+  }
+}
+
+function buildRoutes(): Route[] {
+  const define = (
+    method: string,
+    path: string,
+    handler: (ctx: RequestContext, deps: ServerDeps) => Promise<Reply>,
+  ): Route => ({ method, path, pattern: compile(path), handle: handler })
+
+  return [
+    /**
+     * Static, deliberately. Liveness answers one question — should this process be killed and
+     * restarted — and a liveness probe that consults a dependency restarts a healthy process
+     * every time a dependency blinks. Readiness is where dependencies belong.
+     */
+    define('GET', '/livez', async (_ctx, deps) => ({ status: 200, body: deps.lifecycle.livez() })),
+
+    define('GET', '/readyz', async (_ctx, deps) => {
+      const report = await deps.lifecycle.readyz()
+      // 503 is what removes this replica from the balancer. The image backend is a SOFT probe, so
+      // a resource with no deployed model leaves the report `degraded` and still ready: brand
+      // kits, reads and placeholder generation all still work, and removing the whole service
+      // from rotation over the one thing that does not would be an outage of choice.
+      return { status: report.ready ? 200 : 503, body: report }
+    }),
+
+    define('GET', '/metrics', async (ctx, deps) => {
+      try {
+        await deps.beforeScrape?.()
+      } catch (err) {
+        // A gauge that could not be sampled is a stale gauge. Failing the scrape instead would
+        // lose every other metric too, and blind the dashboard at the moment it is needed.
+        ctx.log.warn('gauge refresh failed; serving the previous values', { err })
+      }
+      return {
+        status: 200,
+        text: deps.metrics.render(),
+        contentType: 'text/plain; version=0.0.4; charset=utf-8',
+      }
+    }),
+
+    /**
+     * What this service can generate with, and whether it can generate at all.
+     *
+     * Unauthenticated, like `mint`'s catalogue: it names no customer, carries no key, and a
+     * capability a caller cannot discover without a token is a capability they will discover by
+     * having a job fail instead.
+     *
+     * `?probe=1` makes a real, minimal image and therefore a real charge, so it requires a token
+     * and the write scope. Everything else is read from state a real call already produced.
+     */
+    define('GET', '/v1/backend', async (ctx, deps) => {
+      if (ctx.url.searchParams.get('probe') === '1') {
+        const principal = await authenticate(ctx, deps)
+        if (principal.kind === 'service') requireScope(principal, WRITE_SCOPE)
+        ctx.log.info('backend probe requested; this makes a real image call')
+        return { status: 200, body: await deps.preflight.probe() }
+      }
+      return { status: 200, body: deps.preflight.report() }
+    }),
+
+    define('POST', '/v1/brand-kits', async (ctx, deps) => {
+      const principal = await authenticate(ctx, deps)
+      if (principal.kind === 'service') requireScope(principal, WRITE_SCOPE)
+      const body = await readJson(ctx.req)
+      const ownerSubject = subjectOf(principal, body)
+
+      const name = requireString(body, 'name', 200)
+      const accent = requireString(body, 'accent', 7)
+      if (!ACCENT_PATTERN.test(accent)) {
+        throw new BadRequestError('accent must be a hex colour such as #ff4d00')
+      }
+
+      const done = deps.lifecycle.track()
+      try {
+        const kit = await deps.kits.create({
+          ownerSubject,
+          name,
+          accent,
+          palette: readPalette(body['palette']),
+          typography: readTypography(body['typography']),
+          stylePrompt: optionalString(body['stylePrompt'], MAX_STYLE_PROMPT) ?? '',
+          actor: actorOf(principal),
+          correlationId: ctx.requestId,
+        })
+        deps.metrics.increment('studio_brand_kits_created_total', { actor_kind: principal.kind })
+        ctx.log.info('brand kit created', { brandKitId: kit.id })
+        return { status: 201, body: { brandKit: kit } }
+      } finally {
+        done()
+      }
+    }),
+
+    define('GET', '/v1/brand-kits/:id', async (ctx, deps) => {
+      const principal = await authenticate(ctx, deps)
+      if (principal.kind === 'service') requireScope(principal, READ_SCOPE)
+      return { status: 200, body: { brandKit: await ownedKit(ctx, deps, principal) } }
+    }),
+
+    /**
+     * **202. THE GENERATION LEAVES THE REQUEST HERE.** See the file header.
+     *
+     * Everything expensive about this handler is the credit reservation, which is one conditional
+     * UPDATE. No model is contacted, so a refusal — for a bad spec or an exhausted cap — costs
+     * nothing and cannot itself be the thing that goes over the cap.
+     */
+    define('POST', '/v1/brand-kits/:id/generate', async (ctx, deps) => {
+      const principal = await authenticate(ctx, deps)
+      if (principal.kind === 'service') requireScope(principal, WRITE_SCOPE)
+      const kit = await ownedKit(ctx, deps, principal)
+      const body = await readJson(ctx.req)
+
+      const kind = typeof body['kind'] === 'string' ? body['kind'] : ''
+      // `specFor` throws SpecError, mapped to 400, and it is the only place a size is validated.
+      const spec = specFor(kind, {
+        width: optionalInteger(body['width']),
+        height: optionalInteger(body['height']),
+        format: typeof body['format'] === 'string' ? body['format'] : undefined,
+      })
+
+      const requested = typeof body['backend'] === 'string' ? body['backend'] : 'auto'
+      if (!isBackendChoice(requested)) {
+        throw new BadRequestError('backend must be auto, flux or placeholder')
+      }
+      const choice: BackendChoice = requested
+
+      const done = deps.lifecycle.track()
+      try {
+        const job = await deps.generation.request({
+          kit,
+          spec,
+          choice,
+          actor: actorOf(principal),
+          correlationId: ctx.requestId,
+        })
+        deps.metrics.increment('studio_generations_requested_total', {
+          kind: spec.kind,
+          backend_choice: choice,
+        })
+        ctx.log.info('generation accepted', { generationJobId: job.id, kind: spec.kind })
+
+        const statusUrl = `/v1/jobs/${job.id}`
+        return {
+          status: 202,
+          headers: { location: statusUrl },
+          body: {
+            accepted: true,
+            job: wireJob(job),
+            // Named in the body as well as the header, because a browser client reading JSON
+            // should not have to know that `Location` on a 202 means something different from
+            // what it means on a 201.
+            statusUrl,
+          },
+        }
+      } finally {
+        done()
+      }
+    }),
+
+    /** The status URL a 202 points at. Cheap, pollable, and it reaches no model. */
+    define('GET', '/v1/jobs/:id', async (ctx, deps) => {
+      const principal = await authenticate(ctx, deps)
+      if (principal.kind === 'service') requireScope(principal, READ_SCOPE)
+      const job = await deps.reads.findJob(idOf(ctx))
+      if (!job) throw new NotFoundError('no such generation job')
+      assertOwned(principal, job.ownerSubject)
+      return { status: 200, body: { job: wireJob(job), provenance: provenanceOf(job) } }
+    }),
+
+    define('GET', '/v1/assets/:id', async (ctx, deps) => {
+      const principal = await authenticate(ctx, deps)
+      if (principal.kind === 'service') requireScope(principal, READ_SCOPE)
+      const asset = await deps.reads.findAsset(idOf(ctx))
+      if (!asset) throw new NotFoundError('no such asset')
+      const job = await deps.reads.findJob(asset.generationJobId)
+      // An asset without its job is the state this whole service exists to make impossible, so it
+      // is a 500 rather than a partial answer: `on delete restrict` should have prevented it.
+      if (!job) throw new Error(`asset ${asset.id} has no generation job`)
+      assertOwned(principal, job.ownerSubject)
+      return { status: 200, body: { asset, provenance: provenanceOf(job) } }
+    }),
+  ]
+}
+
+/* ------------------------------------------------------------------------ helpers */
+
+function wireJob(job: GenerationJob): Record<string, unknown> {
+  return {
+    id: job.id,
+    brandKitId: job.brandKitId,
+    status: job.status,
+    kind: job.spec.kind,
+    size: `${job.spec.width}x${job.spec.height}`,
+    format: job.spec.format,
+    backend: job.backend,
+    model: job.model,
+    // bigint is not JSON-serialisable and a Number would lose precision at scale, so money
+    // crosses the wire as a decimal string. The same rule mint applies to token supply.
+    costEstimateUsdMicros: job.costEstimateUsdMicros.toString(),
+    costActualUsdMicros: job.costActualUsdMicros.toString(),
+    creditState: job.creditState,
+    errorCode: job.errorCode,
+    errorDetail: job.errorDetail,
+    createdAt: job.createdAt,
+    finishedAt: job.finishedAt,
+  }
+}
+
+async function authenticate(ctx: RequestContext, deps: ServerDeps): Promise<Principal> {
+  const token = bearerFrom(headerOf(ctx.req, 'authorization'))
+  // A missing token is a token fault, so it takes the same 401 path as a bad one rather than
+  // being a separate branch that can drift away from it.
+  if (!token) throw new TokenError('no bearer token presented', 'missing')
+  return deps.verifier.principal(token)
+}
+
+function actorOf(principal: Principal): string {
+  return principal.kind === 'user' ? `user:${principal.userId}` : `service:${principal.service}`
+}
+
+/** `user:<uuid>`. The subject spelling the rest of the estate uses. */
+function subjectOf(principal: Principal, body: Record<string, unknown>): string {
+  const requested = typeof body['userId'] === 'string' ? body['userId'] : undefined
+  return `user:${subjectUserId(principal, requested)}`
+}
+
+function idOf(ctx: RequestContext): string {
+  const id = ctx.params['id']
+  if (!id) throw new BadRequestError('an id is required')
+  return id
+}
+
+/**
+ * A kit the principal may act on.
+ *
+ * A kit that exists but belongs to somebody else is **404**, not 403. A distinct 403 would let
+ * anyone enumerate which ids exist.
+ */
+async function ownedKit(ctx: RequestContext, deps: ServerDeps, principal: Principal): Promise<BrandKit> {
+  const kit = await deps.kits.find(idOf(ctx))
+  if (!kit) throw new NotFoundError('no such brand kit')
+  assertOwned(principal, kit.ownerSubject)
+  return kit
+}
+
+function assertOwned(principal: Principal, ownerSubject: string): void {
+  if (isAdmin(principal)) return
+  // A service token with a scope acts on behalf of the estate and is not narrowed further here;
+  // the scope IS its authority. A user token must match the subject.
+  if (principal.kind === 'service') return
+  if (ownerSubject !== `user:${principal.userId}`) throw new NotFoundError('no such resource')
+}
+
+function requireString(body: Record<string, unknown>, field: string, max: number): string {
+  const value = body[field]
+  if (typeof value !== 'string' || value.trim().length === 0 || value.length > max) {
+    throw new BadRequestError(`${field} must be a string of 1 to ${max} characters`)
+  }
+  return value.trim()
+}
+
+function optionalString(value: unknown, max: number): string | undefined {
+  if (value === undefined || value === null) return undefined
+  if (typeof value !== 'string' || value.length > max) {
+    throw new BadRequestError(`expected a string of at most ${max} characters`)
+  }
+  return value
+}
+
+function optionalInteger(value: unknown): number | undefined {
+  if (value === undefined || value === null) return undefined
+  if (typeof value !== 'number' || !Number.isInteger(value)) {
+    throw new BadRequestError('width and height must be whole numbers')
+  }
+  return value
+}
+
+function readPalette(value: unknown): string[] {
+  if (value === undefined || value === null) return []
+  if (!Array.isArray(value) || value.length > MAX_PALETTE) {
+    throw new BadRequestError(`palette must be an array of at most ${MAX_PALETTE} hex colours`)
+  }
+  return value.map((entry) => {
+    if (typeof entry !== 'string' || !ACCENT_PATTERN.test(entry)) {
+      throw new BadRequestError('every palette entry must be a hex colour such as #12100f')
+    }
+    return entry
+  })
+}
+
+function readTypography(value: unknown): Record<string, string> {
+  if (value === undefined || value === null) return {}
+  if (typeof value !== 'object' || Array.isArray(value)) {
+    throw new BadRequestError('typography must be an object of string values')
+  }
+  const out: Record<string, string> = {}
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof entry !== 'string' || entry.length > 200) {
+      throw new BadRequestError(`typography.${key} must be a string of at most 200 characters`)
+    }
+    out[key] = entry
+  }
+  return out
+}
+
+async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
+  const chunks: Buffer[] = []
+  let size = 0
+  for await (const chunk of req) {
+    const buffer = chunk as Buffer
+    size += buffer.length
+    // Capped before buffering, not after: an unbounded body is a memory exhaustion primitive that
+    // any unauthenticated caller can reach.
+    if (size > MAX_BODY_BYTES) throw new BadRequestError('request body too large')
+    chunks.push(buffer)
+  }
+  if (size === 0) return {}
+  try {
+    const parsed: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      throw new BadRequestError('request body must be a JSON object')
+    }
+    return parsed as Record<string, unknown>
+  } catch (err) {
+    if (err instanceof BadRequestError) throw err
+    throw new BadRequestError('request body is not valid JSON')
+  }
+}
+
+/**
+ * The error shape, identical on every failure and always carrying the request id.
+ *
+ * The id in the body rather than only in the header is what makes a support conversation work: a
+ * user can read back what their browser showed them, and it joins to the log line and the trace.
+ */
+function errorReply(status: number, code: string, message: string, requestId: string): Reply {
+  return { status, body: { error: { code, message, requestId } } }
+}
+
+function send(res: ServerResponse, reply: Reply, requestId: string): void {
+  if (res.writableEnded) return
+  const payload = reply.text ?? `${JSON.stringify(reply.body ?? {})}\n`
+  res.writeHead(reply.status, {
+    ...(reply.headers ?? {}),
+    'content-type': reply.contentType ?? 'application/json; charset=utf-8',
+    'content-length': Buffer.byteLength(payload),
+    'x-request-id': requestId,
+    // Health, metrics and job status are a point-in-time fact. A cached 200 from a replica that
+    // has since gone unready is exactly the lie this arrangement exists to stop telling.
+    'cache-control': 'no-store',
+  })
+  res.end(payload)
+}
+
+function headerOf(req: IncomingMessage, name: string): string | undefined {
+  const value = req.headers[name]
+  return Array.isArray(value) ? value[0] : value
+}

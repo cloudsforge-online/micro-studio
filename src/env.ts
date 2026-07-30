@@ -1,0 +1,374 @@
+/**
+ * Configuration, validated at import.
+ *
+ * Rule 9 of docs/ecosystem/03 §2 — "a repo declares the variables it needs; the deploy provides
+ * exactly those" — is a property of this file. Every variable the service reads is named here and
+ * nowhere else, so the deploy manifest can be derived from it and `env_file: .env` fan-out (which
+ * hands every container the whole estate's secrets) has nothing to justify it.
+ *
+ * Two behaviours are copied deliberately from custody, which is the only place in the frozen
+ * estate that gets this right:
+ *
+ *   1. **A missing variable names itself.** `undefined` propagating into a connection string
+ *      surfaces four layers later as an unreadable driver error.
+ *   2. **A known placeholder is refused outright.** A default secret in source is not convenient,
+ *      it is catastrophic, and a placeholder that boots is a placeholder that reaches production.
+ *
+ * ## The image backend is OPTIONAL, and that is the whole point
+ *
+ * `AZURE_FOUNDRY_*` is optional. A service that refused to boot without a reachable image model
+ * would be a service that cannot create a brand kit, read one, or serve its own health while the
+ * owner is still deciding which model to deploy. Absent configuration is reported as `degraded`
+ * through a SOFT readiness probe and through `GET /v1/backend`. It is never a boot failure and
+ * never a 500.
+ *
+ * ## The Foundry key is a spend credential
+ *
+ * It is read here, held in one field, and passed to exactly one module. It is never logged, never
+ * put in a probe `detail`, never echoed by `GET /v1/backend`, and never written to a committed
+ * file. `redactedEndpoint` below exists so an operator can be told WHICH resource is configured
+ * without being shown anything they could spend.
+ */
+
+import { hostname } from 'node:os'
+
+/**
+ * The service's own name. A constant rather than a variable: it is a property of the repository,
+ * not of the deployment, and making it configurable is how two services end up sharing a
+ * migration advisory lock.
+ */
+export const SERVICE = 'studio'
+
+/** Raised by `loadEnv`. Distinct so a caller can tell configuration from every other failure. */
+export class EnvError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'EnvError'
+  }
+}
+
+/**
+ * Values that must never be accepted. The list is short on purpose: it holds the strings that
+ * actually appear in this repository's own `.env.example` and compose files, because those are
+ * the ones that get copied into a deployment by someone in a hurry.
+ */
+const PLACEHOLDERS = new Set([
+  'changeme',
+  'change-me',
+  'placeholder',
+  'secret',
+  'token',
+  'dev-secret',
+  'dev-outbox-signing-secret',
+  'replace-me',
+  'replace-with-a-real-secret',
+  'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
+])
+
+type Source = Readonly<Record<string, string | undefined>>
+
+function required(source: Source, name: string): string {
+  const value = source[name]?.trim()
+  if (!value) throw new EnvError(`${name} is required — ${SERVICE} refuses to start without it`)
+  return value
+}
+
+function requiredSecret(source: Source, name: string, minLength = 24): string {
+  const value = required(source, name)
+  if (PLACEHOLDERS.has(value.toLowerCase())) {
+    throw new EnvError(`${name} is set to a known placeholder — generate a real secret`)
+  }
+  // Length is a proxy for entropy and the only one available here. It is set above the point at
+  // which a human-chosen string is plausible, so a memorable password fails this check too.
+  if (value.length < minLength) {
+    throw new EnvError(`${name} must be at least ${minLength} characters (got ${value.length})`)
+  }
+  return value
+}
+
+/**
+ * A secret that may be absent, but must not be a placeholder when it is present.
+ *
+ * No length floor: an API key's length is the vendor's decision, and inventing a minimum here
+ * would refuse a perfectly valid credential the day Azure shortens its format.
+ */
+function optionalSecret(source: Source, name: string): string {
+  const value = source[name]?.trim() ?? ''
+  if (value.length === 0) return ''
+  if (PLACEHOLDERS.has(value.toLowerCase())) {
+    throw new EnvError(`${name} is set to a known placeholder — supply the real key or unset it`)
+  }
+  return value
+}
+
+function optional(source: Source, name: string, fallback: string): string {
+  const value = source[name]?.trim()
+  return value && value.length > 0 ? value : fallback
+}
+
+function integer(source: Source, name: string, fallback: number, min: number, max: number): number {
+  const raw = source[name]?.trim()
+  if (!raw) return fallback
+  const value = Number(raw)
+  if (!Number.isInteger(value) || value < min || value > max) {
+    throw new EnvError(`${name} must be a whole number between ${min} and ${max} (got ${raw})`)
+  }
+  return value
+}
+
+/**
+ * An HTTPS base URL with no path and no trailing slash.
+ *
+ * Checked rather than trusted because every Azure request is built by string concatenation from
+ * it. A trailing slash produces `…azure.com//openai/…`, which 404s in a way that is indistinguish-
+ * able from "the deployment does not exist" — and this service's whole job is to tell those apart.
+ */
+function baseUrl(source: Source, name: string, fallback: string): string {
+  const raw = optional(source, name, fallback)
+  if (raw.length === 0) return ''
+  let parsed: URL
+  try {
+    parsed = new URL(raw)
+  } catch {
+    throw new EnvError(`${name} must be an absolute URL (got ${raw.slice(0, 60)})`)
+  }
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+    throw new EnvError(`${name} must be http or https`)
+  }
+  if (parsed.search || parsed.hash) throw new EnvError(`${name} must not carry a query or fragment`)
+  return `${parsed.origin}${parsed.pathname.replace(/\/+$/, '')}`
+}
+
+/**
+ * A model name, as Black Forest Labs spells it.
+ *
+ * **Dots are significant and this is the trap.** The deployed model is `FLUX.2-pro`. The URL path
+ * segment for the same model is `flux-2-pro`, and sending `flux-2-pro` as the `model` field
+ * returns `404 DeploymentNotFound` — verified against the live resource. Path spelling and model
+ * spelling are different strings, so `.` must be in the permitted set here or a correct
+ * configuration would be refused at boot.
+ */
+function modelName(source: Source, name: string, fallback: string): string {
+  const raw = optional(source, name, fallback)
+  if (raw.length === 0) return ''
+  if (!/^[A-Za-z0-9._-]{1,64}$/.test(raw)) {
+    throw new EnvError(
+      `${name} must be 1-64 characters of letters, digits, '.', '-' or '_' (got ${raw})`,
+    )
+  }
+  return raw
+}
+
+/**
+ * The provider path under the endpoint, e.g. `/providers/blackforestlabs/v1/flux-2-pro`.
+ *
+ * Configurable rather than hardcoded because it names both the provider and the model route, and
+ * a second model on this resource would live at a different path. Leading slash required, trailing
+ * slash refused: the URL is built by concatenation and `…com//providers` 404s in a way that reads
+ * exactly like a missing deployment.
+ */
+function providerPath(source: Source, name: string, fallback: string): string {
+  const raw = optional(source, name, fallback)
+  if (!raw.startsWith('/')) throw new EnvError(`${name} must begin with '/' (got ${raw})`)
+  if (raw.endsWith('/')) throw new EnvError(`${name} must not end with '/' (got ${raw})`)
+  if (!/^[A-Za-z0-9._~/-]{2,200}$/.test(raw)) {
+    throw new EnvError(`${name} contains characters that are not valid in a URL path`)
+  }
+  return raw
+}
+
+/** Dollars in, integer micro-dollars out. Money is never a float in this service. */
+function usdMicros(source: Source, name: string, fallbackDollars: number): bigint {
+  const raw = source[name]?.trim()
+  const dollars = raw ? Number(raw) : fallbackDollars
+  if (!Number.isFinite(dollars) || dollars < 0 || dollars > 1_000_000) {
+    throw new EnvError(`${name} must be a number of dollars between 0 and 1000000 (got ${raw})`)
+  }
+  // Rounded at the micro-dollar, which is four orders of magnitude finer than the cheapest image
+  // this service can buy. A cap is a ceiling, so rounding down is the safe direction.
+  return BigInt(Math.floor(dollars * 1_000_000))
+}
+
+/** The Azure AI Foundry resource serving FLUX. */
+export interface FluxConfig {
+  readonly endpoint: string
+  readonly apiKey: string
+  /** `/providers/blackforestlabs/v1/flux-2-pro`. Named separately from the model — see below. */
+  readonly imagePath: string
+  /**
+   * The primary model, sent in the request BODY. `FLUX.2-pro`.
+   *
+   * Not the same string as the path segment, and not optional: omitting it returns
+   * `400 no_model_name` even though the path already names the model. Verified.
+   */
+  readonly model: string
+  /**
+   * Tried on 404, 429 and 5xx. **Empty by default**, because only `FLUX.2-pro` is deployed on
+   * this resource — seven other FLUX names were probed and all seven answer 404. Configurable
+   * rather than hardcoded so a second model can be adopted without a code change.
+   */
+  readonly fallbackModel: string
+}
+
+export interface Env {
+  readonly port: number
+  readonly env: string
+  readonly version: string
+  readonly logLevel: 'debug' | 'info' | 'warn' | 'error'
+  /**
+   * Rule 1: one database, named by this service's own variable. The CI check greps for any other
+   * connection-string variable, so adding a second one here fails the build rather than review.
+   */
+  readonly databaseUrl: string
+  readonly databasePoolMax: number
+  readonly identityJwksUrl: string
+  readonly identityIssuer: string
+  /** HMAC key for outbound event signatures, so a subscriber can prove an event came from us. */
+  readonly outboxSigningSecret: string
+  /**
+   * Names this replica in `jobs.locked_by`. Defaults to the hostname, which is the container id
+   * under compose and the pod name under Kubernetes — in both cases the thing an operator would
+   * search for after finding a stuck lease.
+   */
+  readonly instanceId: string
+
+  /** `null` when the resource is not configured. Not an empty-string sentinel: a caller that
+   *  forgets to check gets a type error rather than a request to `undefined/providers/…`. */
+  readonly flux: FluxConfig | null
+  readonly imageDeadlineMs: number
+  /**
+   * The estimated price of one image, in whole US dollars, used for the credit reservation.
+   *
+   * Configuration rather than a table in code, because the provider does not publish a per-image
+   * dollar rate on this surface: the response carries `request_meta.cost` in provider units (a
+   * flat 3 per image at every size probed, from 256² to 1200x630) and no exchange rate. A number
+   * this service invented and hardcoded would be a number nobody could correct. The provider's
+   * own `cost` figure is recorded verbatim on every job alongside this estimate.
+   */
+  readonly imagePriceUsdMicros: bigint
+
+  readonly assetRoot: string
+  /** Empty means `storage_url` is written as a `file://` URL of the absolute path. */
+  readonly assetBaseUrl: string
+
+  readonly defaultCreditCapUsdMicros: bigint
+}
+
+const LEVELS = new Set(['debug', 'info', 'warn', 'error'])
+
+/**
+ * Pure over its source so the failure paths are testable without mutating the process. The eager
+ * export below is what makes the service fail fast.
+ */
+export function loadEnv(source: Source = process.env, host = ''): Env {
+  const logLevel = optional(source, 'LOG_LEVEL', 'info')
+  if (!LEVELS.has(logLevel)) {
+    throw new EnvError(`LOG_LEVEL must be one of debug, info, warn, error (got ${logLevel})`)
+  }
+
+  const fluxEndpoint = baseUrl(source, 'AZURE_FOUNDRY_ENDPOINT', '')
+  const fluxKey = optionalSecret(source, 'AZURE_FOUNDRY_API_KEY')
+  // Both halves or neither. Half-configured is the state that produces a 401 loop nobody can read:
+  // an endpoint with no key looks exactly like a key that has been revoked.
+  if (Boolean(fluxEndpoint) !== Boolean(fluxKey)) {
+    throw new EnvError(
+      'AZURE_FOUNDRY_ENDPOINT and AZURE_FOUNDRY_API_KEY must be set together, or neither — ' +
+        'a half-configured resource fails as an unreadable 401',
+    )
+  }
+  const model = modelName(source, 'STUDIO_IMAGE_MODEL', fluxEndpoint ? 'FLUX.2-pro' : '')
+  if (fluxEndpoint && !model) {
+    throw new EnvError('STUDIO_IMAGE_MODEL is required when AZURE_FOUNDRY_ENDPOINT is set')
+  }
+  const fallbackModel = modelName(source, 'STUDIO_IMAGE_FALLBACK_MODEL', '')
+  // A fallback identical to the primary would double every failed call for no chance of success.
+  if (fallbackModel && fallbackModel === model) {
+    throw new EnvError('STUDIO_IMAGE_FALLBACK_MODEL must differ from STUDIO_IMAGE_MODEL')
+  }
+
+  return {
+    port: integer(source, 'PORT', 4012, 1, 65_535),
+    env: optional(source, 'NODE_ENV', 'development'),
+    version: optional(source, 'CLOUDSFORGE_TAG', 'dev'),
+    logLevel: logLevel as Env['logLevel'],
+    databaseUrl: required(source, 'STUDIO_DATABASE_URL'),
+    // A pool larger than the database's own connection budget divided by the replica count is a
+    // service that exhausts Postgres for everything else the moment it scales.
+    databasePoolMax: integer(source, 'STUDIO_DATABASE_POOL_MAX', 10, 1, 100),
+    identityJwksUrl: required(source, 'IDENTITY_JWKS_URL'),
+    identityIssuer: required(source, 'IDENTITY_ISSUER'),
+    outboxSigningSecret: requiredSecret(source, 'OUTBOX_SIGNING_SECRET'),
+    instanceId: optional(source, 'INSTANCE_ID', host || 'unknown'),
+
+    flux: fluxEndpoint
+      ? {
+          endpoint: fluxEndpoint,
+          apiKey: fluxKey,
+          imagePath: providerPath(
+            source,
+            'AZURE_FOUNDRY_IMAGE_PATH',
+            '/providers/blackforestlabs/v1/flux-2-pro',
+          ),
+          model,
+          fallbackModel,
+        }
+      : null,
+    // Generous, because generation runs in a leased job rather than in the request. Bounded,
+    // because a hung call holds a lease and a runner slot for as long as it hangs. A measured
+    // FLUX.2-pro call at 1024 square takes roughly 20 to 40 seconds.
+    imageDeadlineMs: integer(source, 'STUDIO_IMAGE_DEADLINE_MS', 120_000, 1_000, 600_000),
+    imagePriceUsdMicros: usdMicros(source, 'STUDIO_IMAGE_PRICE_USD', 0.06),
+
+    assetRoot: optional(source, 'STUDIO_ASSET_ROOT', './out'),
+    assetBaseUrl: baseUrl(source, 'STUDIO_ASSET_BASE_URL', ''),
+
+    defaultCreditCapUsdMicros: usdMicros(source, 'STUDIO_DEFAULT_CREDIT_CAP_USD', 5),
+  }
+}
+
+/**
+ * The Foundry resource host, for logs and for `GET /v1/backend`.
+ *
+ * The host without the key. An operator debugging "which resource is this pointed at" needs the
+ * hostname and must never be handed the credential, and the two travel together everywhere else.
+ */
+export function redactedEndpoint(flux: FluxConfig | null): string | null {
+  if (!flux) return null
+  try {
+    return new URL(flux.endpoint).host
+  } catch {
+    return null
+  }
+}
+
+/**
+ * The checks above run at import, before the logger exists, so an uncaught throw reaches the
+ * container as a bare V8 stack: not JSON, no level, no service name. The collector drops it and
+ * the only symptom an operator gets is a container that exits instantly.
+ *
+ * So emit one structured fatal line by hand. It is built from a literal rather than routed
+ * through the telemetry package: nothing that can itself fail may sit between a configuration
+ * error and the report of it. The message is the one `loadEnv` produced, which by construction
+ * never contains a value.
+ */
+function fatalConfig(err: unknown): never {
+  const message = err instanceof Error ? err.message : String(err)
+  process.stderr.write(
+    `${JSON.stringify({
+      time: new Date().toISOString(),
+      level: 'fatal',
+      service: SERVICE,
+      step: 'env',
+      msg: `startup failed at: env — ${message}`,
+    })}\n`,
+  )
+  process.exit(1)
+}
+
+export const env: Env = (() => {
+  try {
+    return loadEnv(process.env, hostname())
+  } catch (err) {
+    fatalConfig(err)
+  }
+})()

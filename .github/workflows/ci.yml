@@ -1,0 +1,163 @@
+# Continuous integration.
+#
+# ────────────────────────────────────────────────────────────────────────────────────────────────
+# THIS FILE IS TEMPORARY. Once `cloudsforge/.github` exists (AD-03) everything below is deleted and
+# replaced by a call to the shared reusable workflow. The measured target in docs/ecosystem/03 §5
+# is zero repositories with a bespoke CI file, so treat every line here as a liability with a
+# deletion date rather than as something to extend.
+# ────────────────────────────────────────────────────────────────────────────────────────────────
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        # Not a secret: this database exists for the length of one job and holds nothing.
+        env:
+          POSTGRES_USER: studio
+          POSTGRES_PASSWORD: studio
+          POSTGRES_DB: studio_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U studio"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: studio }
+
+      # Temporary, for the same reason as the Dockerfile's second build context: the runtime
+      # packages are unpublished and resolve through `link:../runtime`.
+      - uses: actions/checkout@v4
+        with:
+          repository: cloudsforge/runtime
+          path: runtime
+
+      - uses: pnpm/action-setup@v4
+        with: { version: 11.9.0 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: pnpm, cache-dependency-path: studio/pnpm-lock.yaml }
+
+      - name: Install
+        working-directory: studio
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        working-directory: studio
+        run: pnpm typecheck
+
+      - name: Migrate the test database
+        working-directory: studio
+        # The migrator is exercised as a migrator, on an empty database, exactly as a deploy runs
+        # it. A schema created by the test suite instead would never prove the one-shot job works —
+        # and this service's spend cap only exists because that job ran.
+        env:
+          STUDIO_DATABASE_URL: postgres://studio:studio@127.0.0.1:5432/studio_test
+          IDENTITY_JWKS_URL: http://127.0.0.1:4001/.well-known/jwks.json
+          IDENTITY_ISSUER: http://127.0.0.1:4001
+          OUTBOX_SIGNING_SECRET: ci-only-not-a-real-secret-000000000000
+        run: pnpm migrate
+
+      - name: Test
+        working-directory: studio
+        # No image credential is supplied, so the three live tests skip and every other test runs
+        # against the fake FLUX server. CI must never spend money.
+        env:
+          STUDIO_TEST_DATABASE_URL: postgres://studio:studio@127.0.0.1:5432/studio_test
+        run: pnpm test
+
+  # The estate-wide rules from docs/ecosystem/03 §2, as checks rather than as review discipline.
+  rules:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 'Rule 1 — one database, and it is this service''s own'
+        run: |
+          if grep -rnE '[A-Z_]*DATABASE_URL' src/ --include='*.ts' \
+             | grep -vE 'STUDIO_DATABASE_URL|STUDIO_TEST_DATABASE_URL'; then
+            echo '::error::a connection string other than STUDIO_DATABASE_URL is referenced'
+            exit 1
+          fi
+          if grep -rnE '(postgres|postgresql)://' src/ --include='*.ts' \
+             | grep -vE '\.test\.ts|testsupport\.ts'; then
+            echo '::error::a literal connection string appears outside a test'
+            exit 1
+          fi
+
+      - name: 'Rule 4 — livez, readyz and metrics exist'
+        run: |
+          for endpoint in /livez /readyz /metrics; do
+            grep -q "'$endpoint'" src/server.ts \
+              || { echo "::error::$endpoint is not served"; exit 1; }
+          done
+
+      - name: 'Rule 7 — migrations are never run by the service process'
+        run: |
+          if grep -nE '\bmigrate\(' src/index.ts; then
+            echo '::error::index.ts calls migrate — that is the migrator job, not the service'
+            exit 1
+          fi
+
+      - name: 'Rule 8 — every background timer is a leased job'
+        # Comment lines are excluded: this repository DISCUSSES the frozen estate's timers, and a
+        # check that cannot tell a timer from a sentence about one is a check people learn to
+        # ignore.
+        run: |
+          if grep -rnE '\bset(Interval|Timeout)\(' src/ --include='*.ts' \
+             | grep -v '\.test\.ts' \
+             | grep -vE '^[^:]+:[0-9]+: *(//|\*)'; then
+            echo '::error::a timer was found; background work is a leased job (@cloudsforge/jobs)'
+            exit 1
+          fi
+
+      # The generation must not be able to crawl back inside the request. A FLUX call takes 20 to
+      # 40 seconds; doing it in the handler means the money leaves and the record of what it
+      # bought does not arrive.
+      - name: 'The generate route answers 202 and enqueues'
+        run: |
+          grep -q 'status: 202' src/server.ts \
+            || { echo '::error::the generate route no longer answers 202'; exit 1; }
+
+      # THE TRAP. `model` is required in the request BODY even though the URL path names the model;
+      # omitting it is 400 no_model_name. It reads like duplication, which is exactly why somebody
+      # will delete it.
+      - name: 'The FLUX request body always carries `model`'
+        run: |
+          grep -q 'model,' src/backend.ts \
+            || { echo '::error::bodyFor no longer sends `model` — that is 400 no_model_name'; exit 1; }
+
+      # No secret may be committed. `.env.example` carries placeholders only.
+      - name: 'No credential in a committed file'
+        run: |
+          if grep -rnE '(AZURE_FOUNDRY_API_KEY|OUTBOX_SIGNING_SECRET)=[A-Za-z0-9_-]{16,}' \
+             --include='*.example' --include='*.yml' --include='*.ts' --include='*.md' .; then
+            echo '::error::a credential appears to be committed'
+            exit 1
+          fi
+
+      # A `*/` in the MIDDLE of a block comment terminates it early and silently uncomments
+      # whatever follows. The pattern matches a continuation line of a block comment (leading `*`)
+      # that carries a `*/` with more text after it — the only shape that does damage.
+      - name: 'No comment-terminating sequence inside a block comment'
+        run: |
+          if grep -rnE '^\s*\*.*\*/.+' src/ --include='*.ts'; then
+            echo '::error::a */ appears mid-way through a block comment and terminates it early'
+            exit 1
+          fi
