@@ -13,13 +13,25 @@
 
 # ----------------------------------------------------------------------------------- deps
 FROM node:22-slim AS deps
-RUN corepack enable
+# Pin pnpm in the image. The sibling workspaces are installed before this service's own
+# package.json is copied, so corepack has no packageManager field to read at that point and
+# would otherwise grab whatever is latest and then refuse to switch to the 11.9.0 the
+# siblings pin.
+RUN corepack enable && corepack prepare pnpm@11.9.0 --activate
 WORKDIR /app
 
 # Temporary: the link: dependencies resolve to ../runtime relative to this directory, so the
 # packages must exist at that path inside the image for the lockfile to stay frozen.
-COPY --from=runtimepkgs package.json pnpm-workspace.yaml /runtime/
+COPY --from=runtimepkgs package.json pnpm-workspace.yaml pnpm-lock.yaml /runtime/
 COPY --from=runtimepkgs packages /runtime/packages
+
+# Install the runtime workspace's OWN dependencies first. `link:` uses the sibling as-is and
+# does not manage its dependency tree, so /runtime's node_modules must exist independently —
+# both for `tsc` to resolve the runtime source it typechecks (jose, @opentelemetry/api) and
+# for `node --import tsx` to load @cloudsforge/* at run time. Without this the image builds a
+# set of @cloudsforge symlinks that point at source which cannot resolve its own imports.
+RUN --mount=type=cache,id=pnpm-store,target=/pnpm-store,sharing=locked \
+    pnpm --dir /runtime install --frozen-lockfile --config.store-dir=/pnpm-store
 
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 # `--frozen-lockfile` is the point of the step: a build that silently resolves a different
@@ -44,6 +56,10 @@ WORKDIR /app
 # nothing at runtime needs them. No image toolchain either — there is no sharp, no ImageMagick and
 # no `sips`, because this service measures dimensions from the PNG header rather than resampling.
 # That is the whole reason its pipeline runs in CI when asset-forge's cannot.
+# `/runtime` comes across too: /app/node_modules holds @cloudsforge/* as symlinks into it,
+# so without the target the links dangle and the first `import '@cloudsforge/db'` fails at
+# run time.
+COPY --from=build /runtime /runtime
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/package.json ./package.json
 COPY --from=build /app/tsconfig.json /app/tsconfig.base.json ./

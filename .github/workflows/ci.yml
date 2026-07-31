@@ -55,6 +55,12 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: 22, cache: pnpm, cache-dependency-path: studio/pnpm-lock.yaml }
 
+      # `link:` resolves to the sibling's own node_modules, so the runtime must be installed
+      # before this repository is — without this, `tsc` cannot resolve the runtime source it
+      # typechecks (jose, @opentelemetry/api) and `tsx` cannot load @cloudsforge/* at run time.
+      - name: Install the sibling runtime
+        run: pnpm --dir runtime install --frozen-lockfile
+
       - name: Install
         working-directory: studio
         run: pnpm install --frozen-lockfile
