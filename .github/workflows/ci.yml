@@ -46,8 +46,9 @@ jobs:
       # packages are unpublished and resolve through `link:../runtime`.
       - uses: actions/checkout@v4
         with:
-          repository: cloudsforge/runtime
+          repository: cloudsforge-online/micro-runtime
           path: runtime
+          token: ${{ secrets.ESTATE_READ_TOKEN }}
 
       - uses: pnpm/action-setup@v4
         with: { version: 11.9.0 }
