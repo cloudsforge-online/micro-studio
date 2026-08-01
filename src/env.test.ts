@@ -25,7 +25,7 @@ const withEnv = (extra: Record<string, string> = {}) => ({ ...BASE_ENV, ...extra
 test('a complete environment loads, and importing the module did not exit', () => {
   assert.equal(SERVICE, 'studio')
   assert.equal(env.databaseUrl, BASE_ENV['STUDIO_DATABASE_URL'])
-  assert.equal(env.port, 4012)
+  assert.equal(env.port, 4015)
   // Deliberately NOT asserted here: anything derived from `env.flux`.
   //
   // The eager `env` reads the real `process.env`, so a developer who has sourced `.env.local` to

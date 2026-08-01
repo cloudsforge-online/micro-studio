@@ -287,7 +287,7 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
   }
 
   return {
-    port: integer(source, 'PORT', 4012, 1, 65_535),
+    port: integer(source, 'PORT', 4015, 1, 65_535),
     env: optional(source, 'NODE_ENV', 'development'),
     version: optional(source, 'CLOUDSFORGE_TAG', 'dev'),
     logLevel: logLevel as Env['logLevel'],

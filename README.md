@@ -138,11 +138,11 @@ generates through the placeholder backend. The image backend is a **soft** readi
 probe would turn a missing model into an outage of everything else.
 
 ```
-$ curl -s localhost:4012/readyz | jq '.ready, .state'
+$ curl -s localhost:4015/readyz | jq '.ready, .state'
 true
 "degraded"
 
-$ curl -s localhost:4012/v1/backend | jq -r .reason
+$ curl -s localhost:4015/v1/backend | jq -r .reason
 no configured model is deployed on test01eastus01.services.ai.azure.com (FLUX.1.5-pro: not_found
 404). Check the spelling first: the model name uses dots — FLUX.2-pro — and is NOT the hyphenated
 path segment flux-2-pro, which returns DeploymentNotFound. Otherwise deploy the model in the
