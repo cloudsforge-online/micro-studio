@@ -16,6 +16,9 @@
  *
  *     200 {"created":…,"data":[{"b64_json":"…"}],"request_meta":{"cost":3,"output_mp":0.38,…}}
  *
+ *     The cost is NOT flat at every size: 3 per image up to roughly 1MP, measured at 4.5 for a
+ *     1920×768 (the Aetherholm hero). Read request_meta.cost rather than assuming.
+ *
  * 1. **`model` is REQUIRED in the body**, even though the path already names the model. Omitting
  *    it is `400 {"error":{"code":"no_model_name"}}`. This is the single most surprising thing
  *    about the API and `bodyFor` below exists so it cannot be omitted by construction.
