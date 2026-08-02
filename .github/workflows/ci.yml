@@ -114,11 +114,50 @@ jobs:
             || { echo '::error::bodyFor no longer sends `model` — that is 400 no_model_name'; exit 1; }
 
       # No secret may be committed. `.env.example` carries placeholders only.
+      #
+      # A PLACEHOLDER MUST SAY IT IS ONE, and one that does is not a finding. This check matched on
+      # length alone, so the CI-only value this repository's own workflow hands the image smoke test
+      # — `OUTBOX_SIGNING_SECRET=ci-only-not-a-real-secret-000000000000`, which exists solely to
+      # clear env.ts's 24-character check — was reported as a committed credential. The bespoke
+      # workflow this replaced never tripped it only because it wrote its environment as YAML
+      # `KEY: value` rather than `KEY=value`, which is a difference in punctuation, not in safety.
+      #
+      # The allowlist is the SHAPE of a placeholder rather than one spelling of one word, and it is
+      # the same vocabulary micro-org's secret-hygiene.yml settled on after five services failed
+      # that check on values like CHANGE_ME_TO_32_RANDOM_CHARACTERS. A value that does NOT announce
+      # itself as fake is still treated as real, which is the behaviour worth keeping — so
+      # `.github/workflows/` is deliberately still in scope. A guard that fails on correct code gets
+      # bypassed, and this one stands in front of the failure that cannot be undone.
       - name: 'No credential in a committed file'
         run: |
-          if grep -rnE '(AZURE_FOUNDRY_API_KEY|OUTBOX_SIGNING_SECRET)=[A-Za-z0-9_-]{16,}' \
-             --include='*.example' --include='*.yml' --include='*.ts' --include='*.md' .; then
-            echo '::error::a credential appears to be committed'
+          set -uo pipefail
+          placeholder='(not-a-real|ci-only|change[ _-]?me|replace|placeholder|example|your[ _-]|<[a-z]|todo|xxx)'
+
+          # `|| true` is load-bearing: grep exits 1 when it matches nothing, GitHub runs this block
+          # as `bash -e {0}`, and `set -uo pipefail` does not turn `-e` off — so without it a clean
+          # repository aborts the step before the `if` is reached, and the check would only ever
+          # have been exercised on the repositories that fail it.
+          hits=$(grep -rnE '(AZURE_FOUNDRY_API_KEY|OUTBOX_SIGNING_SECRET)=[A-Za-z0-9_-]{16,}' \
+                 --include='*.example' --include='*.yml' --include='*.ts' --include='*.md' . || true)
+
+          # THE PLACEHOLDER TEST IS APPLIED TO THE VALUE, NEVER TO THE WHOLE MATCH LINE. Filtering
+          # the line would test the PATH as well, and `.env.example` — the single file most likely
+          # to hold a pasted credential — contains the word "example", so a real secret in it would
+          # have been filtered out as a placeholder by its own filename. That was true of the first
+          # version of this step and was caught by running it against a deliberately real-looking
+          # value; it is the exact shape of the guards in this estate that passed wrongly for
+          # months. Everything up to and including the variable name is stripped first.
+          suspect=''
+          while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            value=$(printf '%s' "$line" | sed -E 's/.*(AZURE_FOUNDRY_API_KEY|OUTBOX_SIGNING_SECRET)=//')
+            printf '%s' "$value" | grep -qiE "$placeholder" || suspect="${suspect}${line}"$'\n'
+          done <<< "$hits"
+
+          if [ -n "$suspect" ]; then
+            echo '::error::a credential appears to be committed:'
+            printf '%s' "$suspect"
+            echo 'If it is a placeholder, say so in the value — ci-only-…, CHANGE_ME, <your-key>.'
             exit 1
           fi
           echo 'ok: no credential in a committed file'
