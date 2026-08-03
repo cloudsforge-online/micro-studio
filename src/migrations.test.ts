@@ -2,6 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { checksumOf } from '@cloudsforge/db'
 import { BASELINE_VERSION, MIGRATIONS, SCHEMA_VERSION } from './migrations.ts'
+import { ASSET_KINDS } from './specs.ts'
 
 const SQL = MIGRATIONS.map((m) => m.up).join('\n')
 
@@ -75,8 +76,41 @@ test('a finished job has decided about the money, and a failed one says why', ()
   assert.match(SQL, /constraint generation_jobs_failure_has_code/)
 })
 
-test('the asset kinds are exactly the ones the domain model names', () => {
-  assert.match(SQL, /kind in \('mark', 'wordmark', 'favicon', 'og', 'social', 'banner', 'icon', 'tile'\)/)
+test('the asset kinds the database will accept are exactly the ones specs.ts declares', () => {
+  // ══════════════════════════════════════════════════════════════════════════════════════════════
+  // THIS TEST USED TO GRADE A LITERAL, AND THE LITERAL WENT STALE THE MOMENT A KIND WAS ADDED.
+  //
+  // It asserted `kind in ('mark', … 'tile')` against the whole concatenated migration text. That
+  // matched migration 6 — which is immutable and will carry those eight values for ever — so it
+  // stayed GREEN while migration 8 widened the live constraint underneath it. Green, and grading
+  // a fact about history rather than about the schema the service runs against.
+  //
+  // So it now reads the LAST migration that touches the constraint, which is what a database
+  // actually ends up with, and compares that set to `ASSET_KINDS` — the list `specFor` validates
+  // against. The two disagreeing in EITHER direction is a real defect: a kind in TypeScript the
+  // database refuses is a 500 on a valid request, and a kind the database accepts that TypeScript
+  // does not is a row whose prompt `prompt.ts` has no COMPOSITION for.
+  // ══════════════════════════════════════════════════════════════════════════════════════════════
+  const touching = MIGRATIONS.filter((m) => /generation_jobs_kind_known check/.test(m.up))
+  assert.ok(touching.length > 0, 'no migration defines the kind constraint at all')
+  const last = touching[touching.length - 1]
+  assert.ok(last)
+  const clause = /kind in \(([^)]*)\)/.exec(last.up)
+  assert.ok(clause?.[1], `${last.name} declares the constraint without an IN list`)
+  const inSchema = [...clause[1].matchAll(/'([a-z_]+)'/g)].map((m) => m[1]).sort()
+  assert.deepEqual(
+    inSchema,
+    [...ASSET_KINDS].sort(),
+    'the CHECK constraint and ASSET_KINDS disagree about what an asset kind is',
+  )
+  // And the immutable one is still what it was. A migration that has been edited in place is
+  // refused at run time by its checksum; this says so at test time, where the message is readable.
+  const six = MIGRATIONS.find((m) => m.version === 6)
+  assert.match(
+    six?.up ?? '',
+    /kind in \('mark', 'wordmark', 'favicon', 'og', 'social', 'banner', 'icon', 'tile'\)/,
+    'migration 6 has been edited — migration text is immutable once released',
+  )
 })
 
 test('the provenance columns a reproducible brand kit needs all exist', () => {

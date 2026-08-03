@@ -55,6 +55,42 @@ export function brandStyle(accent: string): string {
   )
 }
 
+/**
+ * The art direction for a world object, which is NOT the brand brief.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * `brandStyle()` above says "Brand mark for a software company … flat geometric vector … legible
+ * at 16 pixels". Run a stool through it and a stool is not what comes back: a LOGO of a stool
+ * comes back, and it comes back looking deliberate, so nothing downstream can tell. There is no
+ * assertion anywhere in this service that reads a prompt for meaning, so this would have been
+ * wrong quietly and for ever — the same shape as the copybot guard that stayed green when its
+ * index was dropped.
+ *
+ * So `world_object` takes its own paragraph, and every clause in it is doing work
+ * (23-tessera.md §1.1, §2.1, §2.6):
+ *
+ *   * **painterly gouache, no outlines, no bevels, no gloss** — §1.1's measured argument. A
+ *     hand-painted world is SUPPOSED to vary from tile to tile; a flat-vector world is not, and
+ *     two vector chairs disagreeing by three pixels read as a bug rather than as a brushstroke.
+ *   * **three-quarter isometric from above-left, 2:1 dimetric** — the projection is the world's,
+ *     not the maker's. It is what makes one player's chair sit in the same room as another's.
+ *   * **standing alone on a flat #12100f ground** — diffusion emits no alpha, so transparency is a
+ *     derive step keyed against a KNOWN colour (`brand/normalise_ground.py:27`). A generation on
+ *     any other ground cannot be cut out.
+ *   * **one canonical facing** — the second is a horizontal mirror at render time, because this
+ *     service has no `seed` column and a pipeline that cannot fix a seed cannot render the same
+ *     chair four times (§2.1). Asking for four facings would produce four different chairs.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+export const WORLD_OBJECT_STYLE =
+  'A single object in a persistent isometric world, painted rather than modelled. Painterly ' +
+  'gouache with visible brush economy, warm ash-and-ember key light from the upper left against ' +
+  'cool shadow. Three-quarter isometric view from above-left, 2:1 dimetric projection, one ' +
+  'canonical facing. The object stands alone on a flat ' +
+  `${BRAND_GROUND} ground with nothing else in frame: no background, no scene, no second object, ` +
+  'no cast shadow leaving the frame. No outline, no bevel, no gloss, no 3D render, no ' +
+  'photo-realism, no user-interface framing.'
+
 /** What each kind is, in one sentence, so the composition differs even though the style does not. */
 const COMPOSITION: Readonly<Record<AssetKind, string>> = Object.freeze({
   mark: 'The brand mark. One idea, executed cleanly, centred and symmetrical in a square field with even margins on all four sides.',
@@ -69,6 +105,8 @@ const COMPOSITION: Readonly<Record<AssetKind, string>> = Object.freeze({
     'A wide page banner. The mark held small in one third of the frame and the rest deliberately empty, so overlaid text has somewhere to sit.',
   icon: 'A single interface icon on a flat field, centred, drawn at one weight with no detail that dies below 32 pixels.',
   tile: 'A seamless square tile: the motif repeated on a regular grid so opposite edges meet without a seam.',
+  world_object:
+    'One object, whole and unoccluded, occupying the middle of the square with clear ground all round it so the cutout step has an edge to key against. Its footprint sits on one ground tile; the space above it is headroom, so a tall object may use it and a low object may leave it empty.',
 })
 
 export interface PromptInput {
@@ -87,11 +125,26 @@ export interface PromptInput {
  * "no text" produces a mark with a word in it.
  */
 export function buildPrompt(input: PromptInput): string {
+  // The style paragraph is chosen BY KIND, not by kit. Every kind but one is a brand artefact and
+  // takes `brandStyle(accent)`; `world_object` is a thing in somebody's world and takes the
+  // world's brief. The accent is not interpolated into it at all — a world object wears no
+  // product colour, because it is not chrome. See WORLD_OBJECT_STYLE.
+  const style =
+    input.spec.kind === 'world_object' ? WORLD_OBJECT_STYLE : brandStyle(input.accent)
+  // A world object's subject is the whole point of the request, so it is never allowed to fall
+  // back to the kit's name the way a mark may: a firing with no description would otherwise
+  // silently generate "a Tessera", which is not an object anybody asked for. The route rejects an
+  // empty description before it reaches here; this is the second, structural refusal.
+  if (input.spec.kind === 'world_object' && input.stylePrompt.trim().length === 0) {
+    throw new Error('a world_object generation has no description to build a prompt from')
+  }
   const parts = [
-    brandStyle(input.accent),
+    style,
     COMPOSITION[input.spec.kind],
     input.stylePrompt.trim().length > 0
-      ? `The one idea this mark is built around: ${input.stylePrompt.trim()}`
+      ? input.spec.kind === 'world_object'
+        ? `The object is: ${input.stylePrompt.trim()}`
+        : `The one idea this mark is built around: ${input.stylePrompt.trim()}`
       : `Built around the name "${input.kitName}" and nothing else.`,
     LETTERED.has(input.spec.kind) ? lettering(input.kitName) : NO_TEXT,
   ]

@@ -31,6 +31,30 @@ export const ASSET_KINDS = [
   'banner',
   'icon',
   'tile',
+  /**
+   * A single object in a user-made world, fired from a player's description.
+   *
+   * ══════════════════════════════════════════════════════════════════════════════════════════════
+   * **THE ONE KIND IN THIS CATALOGUE THAT IS NOT A BRAND ARTEFACT**, and the distinction is
+   * load-bearing rather than taxonomic. Every kind above it is a mark, a lockup or a tile for one
+   * brand kit, so its prompt is built from that kit — the accent, the name, the one idea. A world
+   * object belongs to a *place*, not to a brand: `micro-tessera`'s Kiln (23-tessera.md §2.6, §9.1)
+   * turns "a stool" into an object that has to sit in the same world as ninety-five others made by
+   * other people on other days.
+   *
+   * That is why `prompt.ts` gives it its OWN style paragraph rather than `brandStyle()`. A world
+   * object rendered to the brand brief — "Brand mark for a software company, flat geometric
+   * vector… legible at 16 pixels" — comes back a logo of a stool, and it would come back a logo of
+   * a stool while every test in this repository stayed green, because nothing here reads a prompt
+   * for meaning. The kind is what the prompt is built from, which is the reason `specFor` refuses
+   * an invented kind instead of defaulting one.
+   *
+   * 512×512, from 23-tessera.md §2.1: a 1×1 object occupies one 256×128 ground tile and is
+   * authored with three tiles of headroom so a lamp-post fits. Already on the 16-pixel grid FLUX
+   * floors to, so `requestSizeFor` rounds nothing.
+   * ══════════════════════════════════════════════════════════════════════════════════════════════
+   */
+  'world_object',
 ] as const
 
 export type AssetKind = (typeof ASSET_KINDS)[number]
@@ -70,6 +94,8 @@ export const DEFAULT_SIZES: Readonly<Record<AssetKind, { width: number; height: 
     banner: { width: 1536, height: 512 },
     icon: { width: 256, height: 256 },
     tile: { width: 512, height: 512 },
+    /** 23-tessera.md §2.1. One tile of floor, three tiles of headroom. */
+    world_object: { width: 512, height: 512 },
   })
 
 /** Bounds on a caller-supplied size. Generous, but a spec is interpolated into a raster buffer. */

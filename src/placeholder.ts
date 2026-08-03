@@ -71,6 +71,27 @@ function glyph(kind: AssetKind, cx: number, cy: number, r: number, seed: number,
         )
       }).join('')
     }
+    // A world object stand-in: the 2:1 dimetric footprint the real asset sits on, with a body
+    // above it. Drawn as the projection rather than as a shape, because the one thing a
+    // placeholder here has to communicate is which way the world is facing.
+    case 'world_object': {
+      const w = r * 0.9
+      const h = w / 2
+      const lift = r * (0.35 + (seed % 3) * 0.12)
+      const dia = (x: number, y: number): string =>
+        `${n(x)},${n(y - h)} ${n(x + w)},${n(y)} ${n(x)},${n(y + h)} ${n(x - w)},${n(y)}`
+      return (
+        `<polygon points="${dia(cx, cy + r * 0.45)}" fill="none" stroke="${accent}" ` +
+        `stroke-width="${n(sw)}" opacity="0.55"/>` +
+        `<polygon points="${dia(cx, cy + r * 0.45 - lift)}" fill="${accent}" opacity="0.25"/>` +
+        `<polygon points="${dia(cx, cy + r * 0.45 - lift)}" fill="none" stroke="${accent}" ` +
+        `stroke-width="${n(sw)}"/>` +
+        `<line x1="${n(cx - w)}" y1="${n(cy + r * 0.45)}" x2="${n(cx - w)}" ` +
+        `y2="${n(cy + r * 0.45 - lift)}" stroke="${accent}" stroke-width="${n(sw)}"/>` +
+        `<line x1="${n(cx + w)}" y1="${n(cy + r * 0.45)}" x2="${n(cx + w)}" ` +
+        `y2="${n(cy + r * 0.45 - lift)}" stroke="${accent}" stroke-width="${n(sw)}"/>`
+      )
+    }
     case 'icon':
     case 'favicon': {
       const points = Array.from({ length: 6 }, (_, i) => {

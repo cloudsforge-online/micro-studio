@@ -300,6 +300,40 @@ export const MIGRATIONS: readonly Migration[] = [
       create index if not exists assets_kit_idx on assets (brand_kit_id, created_at desc);
     `,
   },
+  {
+    version: 8,
+    name: 'world_object_kind',
+    /**
+     * `world_object` — the ninth asset kind, and the first that is not a brand artefact.
+     *
+     * ══════════════════════════════════════════════════════════════════════════════════════════
+     * **WHY THIS IS A MIGRATION AND NOT AN EDIT TO VERSION 6.** Migration text is IMMUTABLE once
+     * released — `@cloudsforge/db` checksums it and refuses a changed migration, and the fix is
+     * always a new one (`service-template/src/migrations.ts:1-15`). Widening the literal in
+     * version 6 would have left every database that has already run it carrying the OLD
+     * eight-value constraint while `specs.ts` accepted nine, so `specFor('world_object')` would
+     * have returned a valid spec and the insert would have failed at the database with a
+     * constraint violation nobody could have predicted from the TypeScript.
+     *
+     * **AND WHY THE CONSTRAINT IS RE-ADDED RATHER THAN DROPPED.** The enumeration is the reason
+     * `specFor` can say "kind must be one of …" and mean it. A `kind` column with no CHECK would
+     * accept a typo — `world-object`, `worldobject` — as a row, and the row would then be a job
+     * whose prompt was built from a kind `prompt.ts` has no COMPOSITION for. The list is short
+     * and closed on purpose; this widens it by exactly one.
+     *
+     * 23-tessera.md §9.1 calls this "the only change to `micro-studio` the design depends on".
+     * ══════════════════════════════════════════════════════════════════════════════════════════
+     */
+    up: `
+      alter table generation_jobs
+        drop constraint if exists generation_jobs_kind_known;
+      alter table generation_jobs
+        add constraint generation_jobs_kind_known check (
+          kind in ('mark', 'wordmark', 'favicon', 'og', 'social', 'banner', 'icon', 'tile',
+                   'world_object')
+        );
+    `,
+  },
 ]
 
 /**
