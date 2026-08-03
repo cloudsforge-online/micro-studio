@@ -133,8 +133,13 @@ export function buildPrompt(input: PromptInput): string {
     input.spec.kind === 'world_object' ? WORLD_OBJECT_STYLE : brandStyle(input.accent)
   // A world object's subject is the whole point of the request, so it is never allowed to fall
   // back to the kit's name the way a mark may: a firing with no description would otherwise
-  // silently generate "a Tessera", which is not an object anybody asked for. The route rejects an
-  // empty description before it reaches here; this is the second, structural refusal.
+  // silently generate "a Tessera", which is not an object anybody asked for.
+  //
+  // `server.ts` refuses this with a **400** first — search it for `world_object`. That comes
+  // second in the source and first in the call order, and this comment used to assert it while it
+  // did not exist, which made the route 500 on any kit with an empty `stylePrompt`. This throw is
+  // the second, structural refusal: it stands in front of every OTHER caller of `buildPrompt`,
+  // and a caller that reaches it has already got past a guard, so 500 is the right answer there.
   if (input.spec.kind === 'world_object' && input.stylePrompt.trim().length === 0) {
     throw new Error('a world_object generation has no description to build a prompt from')
   }

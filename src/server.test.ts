@@ -20,6 +20,8 @@ import {
 import { assetRootProbe, checkAssetRoot } from './assets.ts'
 import { BrandKitConflictError, type BrandKit, type BrandKitStore, type CreateBrandKit } from './brandkits.ts'
 import { CreditCapError } from './credits.ts'
+import { buildPrompt } from './prompt.ts'
+import { SpecError, specFor } from './specs.ts'
 import { Preflight, imageBackendProbe } from './preflight.ts'
 import { fluxConfigFor } from './testsupport.ts'
 import type { GenerationJob, RequestGenerationInput } from './generation.ts'
@@ -558,6 +560,152 @@ test('an unknown kind or backend is 400 before anything is reserved', async () =
       body: JSON.stringify({ kind: 'mark', backend: 'midjourney' }),
     })
     assert.equal(badBackend.status, 400)
+  })
+})
+
+/**
+ * `world_object` is the one kind whose subject cannot be defaulted. Every other kind falls back to
+ * the kit's name; "a Tessera" is not an object anybody asked for, so `buildPrompt` throws — and a
+ * bare `Error` maps to **500**. The route is where the caller's mistake becomes the caller's
+ * answer, and until this check existed the route did not look at the description at all.
+ */
+test('THE 400: world_object on a kit with no stylePrompt is refused, not 500', async () => {
+  const token = await sign({ sub: USER, handle: 'ash', roles: ['player'] })
+  await withServer({}, async (h) => {
+    const headers = { authorization: `Bearer ${token}`, 'content-type': 'application/json' }
+    // A kit created without one. `POST /v1/brand-kits` accepts that, correctly: a mark built
+    // around the name alone is legitimate, so the refusal belongs at generate time, per kind.
+    const created = await fetch(`${h.url}/v1/brand-kits`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ name: 'Undescribed', accent: '#ff4d00' }),
+    })
+    assert.equal(created.status, 201)
+    const kitId = ((await created.json()) as { brandKit: BrandKit }).brandKit.id
+    assert.equal(h.kits.rows.find((r) => r.id === kitId)?.stylePrompt, '')
+
+    const res = await fetch(`${h.url}/v1/brand-kits/${kitId}/generate`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ kind: 'world_object' }),
+    })
+    // Without the route check this is 202 HERE and 500 in production, because this harness injects
+    // a fake generation port. The real port's first statement is `buildPrompt`, which throws. The
+    // next case pins that 500 with the actual error object rather than describing it.
+    assert.equal(res.status, 400, 'the route accepted an undescribed world_object')
+    const body = (await res.json()) as { error: { code: string; message: string } }
+    assert.equal(body.error.code, 'bad_request')
+    assert.match(body.error.message, /stylePrompt/)
+
+    // THE REFUSAL IS BEFORE THE PIPELINE. `accepted` is the generation port's own record, and
+    // `requestGeneration` calls `buildPrompt` as its first statement — so an empty `accepted` is
+    // the proof that nothing reached `prompt.ts`, that no credit was reserved and that no
+    // `generation_jobs` row was written.
+    assert.deepEqual(h.accepted, [])
+  })
+})
+
+test('and the 500 it replaces was real, not a story about one', async () => {
+  // The error is CAUGHT from the real `buildPrompt` rather than reconstructed, so this cannot go
+  // stale the way the comment in prompt.ts did. It is a bare `Error`: not SpecError, not
+  // BadRequestError, so it lands in `handle`'s final branch — 500, `internal`, "the request could
+  // not be completed", which tells the caller to open a support ticket about their own typo.
+  let thrown: unknown = null
+  try {
+    buildPrompt({ kitName: 'Undescribed', accent: '#ff4d00', stylePrompt: '', spec: specFor('world_object') })
+  } catch (err) {
+    thrown = err
+  }
+  assert.ok(thrown instanceof Error, 'buildPrompt must refuse an undescribed world_object')
+  assert.equal(thrown instanceof SpecError, false, 'a SpecError would already have been a 400')
+
+  const token = await sign({ sub: USER, handle: 'ash', roles: ['player'] })
+  // Injected into the port on a kit that DOES have a description, so the route's own check passes
+  // and the mapping — not the check — is what is under test.
+  await withServer({ refuseWith: thrown }, async (h) => {
+    const res = await fetch(`${h.url}/v1/brand-kits/kit-1/generate`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ kind: 'world_object' }),
+    })
+    assert.equal(res.status, 500)
+    assert.equal(((await res.json()) as { error: { code: string } }).error.code, 'internal')
+  })
+})
+
+test('a world_object on a kit that HAS a description is still 202', async () => {
+  // The property that made the defect invisible: Tessera's Kiln always sets `stylePrompt`, so the
+  // only caller that exists today never met it. This case is what stops the fix refusing that
+  // caller too.
+  const token = await sign({ sub: USER, handle: 'ash', roles: ['player'] })
+  await withServer({}, async (h) => {
+    const headers = { authorization: `Bearer ${token}`, 'content-type': 'application/json' }
+    const created = await fetch(`${h.url}/v1/brand-kits`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ name: 'Kiln', accent: '#ff4d00', stylePrompt: 'a three-legged oak stool' }),
+    })
+    const kitId = ((await created.json()) as { brandKit: BrandKit }).brandKit.id
+
+    const res = await fetch(`${h.url}/v1/brand-kits/${kitId}/generate`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ kind: 'world_object' }),
+    })
+    assert.equal(res.status, 202)
+    assert.equal(h.accepted[0]?.spec.kind, 'world_object')
+    // 512x512 from 23-tessera.md §2.1, already on the 16-pixel grid FLUX floors to.
+    assert.equal(h.accepted[0]?.spec.width, 512)
+    assert.equal(h.accepted[0]?.spec.height, 512)
+  })
+})
+
+test('a blank-but-present stylePrompt is refused too, not just a missing one', async () => {
+  // `"   "` is a description in the JSON sense and no description at all in the only sense that
+  // matters. `buildPrompt` trims; a route check that did not would hand it a prompt reading
+  // "The object is:" and generate whatever the model felt like.
+  const token = await sign({ sub: USER, handle: 'ash', roles: ['player'] })
+  await withServer({}, async (h) => {
+    const headers = { authorization: `Bearer ${token}`, 'content-type': 'application/json' }
+    const created = await fetch(`${h.url}/v1/brand-kits`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ name: 'Whitespace', accent: '#ff4d00', stylePrompt: '   \n  ' }),
+    })
+    const kitId = ((await created.json()) as { brandKit: BrandKit }).brandKit.id
+
+    const res = await fetch(`${h.url}/v1/brand-kits/${kitId}/generate`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ kind: 'world_object' }),
+    })
+    assert.equal(res.status, 400)
+    assert.deepEqual(h.accepted, [])
+  })
+})
+
+test('every OTHER kind still generates from a kit with no stylePrompt', async () => {
+  // The check must be scoped to `world_object`. A mark built around the name alone is exactly what
+  // `buildPrompt`'s "Built around the name … and nothing else" branch is for, and refusing it here
+  // would be a fix that broke eight kinds to repair one.
+  const token = await sign({ sub: USER, handle: 'ash', roles: ['player'] })
+  await withServer({}, async (h) => {
+    const headers = { authorization: `Bearer ${token}`, 'content-type': 'application/json' }
+    const created = await fetch(`${h.url}/v1/brand-kits`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ name: 'Undescribed', accent: '#ff4d00' }),
+    })
+    const kitId = ((await created.json()) as { brandKit: BrandKit }).brandKit.id
+
+    for (const kind of ['mark', 'wordmark', 'favicon', 'og', 'social', 'banner', 'icon', 'tile']) {
+      const res = await fetch(`${h.url}/v1/brand-kits/${kitId}/generate`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ kind }),
+      })
+      assert.equal(res.status, 202, `${kind} must not need a description`)
+    }
   })
 })
 

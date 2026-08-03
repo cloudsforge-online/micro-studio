@@ -166,6 +166,86 @@ test(
   },
 )
 
+/**
+ * The 500 the route now refuses, observed at the layer that produced it.
+ *
+ * `server.test.ts` proves the route answers 400 and that the pipeline is never entered. This is the
+ * other half: what happens when it IS entered with an undescribed `world_object`, against a real
+ * database. It matters because `prompt.ts`'s throw is the second, structural refusal — the one
+ * standing in front of every future caller of `requestGeneration` that is not this route — and a
+ * structural refusal that left a reserved credit or a half-written job behind would be worse than
+ * the 500 it produces.
+ */
+test('an undescribed world_object is refused by the pipeline and leaves no trace', { skip }, async () => {
+  if (!enabled) return
+  await withHarness(async (h) => {
+    // The harness kit HAS a description, so the empty one is made here rather than assumed.
+    const undescribed = await postgresBrandKitStore(h.sql, 'studio').create({
+      ownerSubject: h.kit.ownerSubject,
+      name: 'Undescribed',
+      accent: '#ff4d00',
+      palette: [],
+      typography: {},
+      stylePrompt: '',
+      actor: 'user:test',
+      correlationId: 'req-world-object',
+    })
+
+    await assert.rejects(
+      () =>
+        requestGeneration(h.requestDeps, {
+          kit: undescribed,
+          spec: specFor('world_object'),
+          choice: 'auto',
+          actor: 'user:test',
+          correlationId: 'req-world-object',
+        }),
+      /no description to build a prompt from/,
+    )
+
+    // `buildPrompt` runs BEFORE the transaction opens, which is why there is nothing to roll back:
+    // no job row, no reservation, nothing enqueued, and no image call.
+    const jobs = await h.sql`select count(*)::int as n from generation_jobs`
+    assert.equal(jobs[0]?.['n'], 0)
+    assert.equal((await account(h.sql, h.kit.ownerSubject))?.reservedUsdMicros, 0n)
+    assert.deepEqual(h.enqueued, [])
+    assert.equal(h.fake.requests.length, 0)
+  })
+})
+
+test('a described world_object generates, and its prompt is NOT the brand brief', { skip }, async () => {
+  if (!enabled) return
+  // The kind that exists because running a stool through `brandStyle()` returns a logo of a stool.
+  // Nothing in this service reads a prompt for meaning, so the paragraph it was built from is the
+  // only thing that can be asserted — and it is stored on the row, so it can be.
+  await withHarness(async (h) => {
+    const kits = postgresBrandKitStore(h.sql, 'studio')
+    const kiln = await kits.create({
+      ownerSubject: h.kit.ownerSubject,
+      name: 'Kiln',
+      accent: '#ff4d00',
+      palette: [],
+      typography: {},
+      stylePrompt: 'a three-legged oak stool with a worn seat',
+      actor: 'user:test',
+      correlationId: 'req-stool',
+    })
+
+    const job = await requestGeneration(h.requestDeps, {
+      kit: kiln,
+      spec: specFor('world_object'),
+      choice: 'placeholder',
+      actor: 'user:test',
+      correlationId: 'req-stool',
+    })
+    assert.match(job.prompt, /painterly gouache/i)
+    assert.match(job.prompt, /The object is: a three-legged oak stool with a worn seat/)
+    assert.equal(/Brand mark for a software company/.test(job.prompt), false, 'not the brand brief')
+    // The accent is deliberately absent: a world object wears no product colour.
+    assert.equal(job.prompt.includes('#ff4d00'), false)
+  })
+})
+
 test('a reservation is held at request time and settled when the job succeeds', { skip }, async () => {
   if (!enabled) return
   await withHarness(async (h) => {

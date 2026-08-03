@@ -429,6 +429,21 @@ function buildRoutes(): Route[] {
         format: typeof body['format'] === 'string' ? body['format'] : undefined,
       })
 
+      // A world object IS its description, and the description lives on the kit. Every other kind
+      // falls back to the kit's name — a mark built around "Tessera" is a legitimate mark — but
+      // `world_object` has nothing to fall back to: "a Tessera" is not an object anybody asked
+      // for, so `buildPrompt` refuses it. That refusal is an `Error`, which maps to **500**, and
+      // this route is where the caller's mistake becomes the caller's answer.
+      //
+      // This check is the one `prompt.ts` has always claimed was here and, until now, was not. It
+      // was invisible because Tessera's Kiln always sets `stylePrompt`, so the only caller that
+      // exists could not reach it — a defect waiting for the second caller.
+      if (spec.kind === 'world_object' && kit.stylePrompt.trim().length === 0) {
+        throw new BadRequestError(
+          'a world_object needs a description of the object to make: set stylePrompt on the brand kit',
+        )
+      }
+
       const requested = typeof body['backend'] === 'string' ? body['backend'] : 'auto'
       if (!isBackendChoice(requested)) {
         throw new BadRequestError('backend must be auto, flux or placeholder')
