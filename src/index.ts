@@ -31,7 +31,13 @@ import { SCHEMA_VERSION } from './migrations.ts'
 import { createServer, registerServiceMetrics } from './server.ts'
 import { registerHandlers, rescheduleRecurring, seedRecurring } from './jobs.ts'
 import { postgresBrandKitStore } from './brandkits.ts'
-import { filesystemBlobStore, findAsset } from './assets.ts'
+import {
+  assetRootProbe,
+  checkAssetRoot,
+  describeAssetRootFailure,
+  filesystemBlobStore,
+  findAsset,
+} from './assets.ts'
 import { findJob, requestGeneration, GENERATE_KIND } from './generation.ts'
 import { fluxBackend, placeholderBackend, type BackendSet } from './backend.ts'
 import { Preflight, imageBackendProbe } from './preflight.ts'
@@ -80,7 +86,28 @@ try {
   process.exit(1)
 }
 
-// 5. The image backends. Constructed whether or not a model is reachable: the placeholder always
+// 5. Assert the asset root is writable, in the same shape as the schema assertion above and for
+//    the same reason: a precondition that every request depends on, checked once, before the
+//    socket exists. This one is not hypothetical. `STUDIO_ASSET_ROOT` was unset in the deploy, the
+//    fallback resolved to a root-owned `/app/out` under `USER node`, and every generation of every
+//    kind failed EACCES while the container reported healthy and `/readyz` answered 200.
+//
+//    It writes rather than asking. See `checkAssetRoot` for why `fs.access` would not have caught
+//    it, and note this check runs BEFORE `filesystemBlobStore` is constructed below, because
+//    constructing that store proves nothing — it only calls `resolve()`.
+try {
+  await checkAssetRoot(env.assetRoot)
+} catch (err) {
+  logger.fatal('asset root is not writable', {
+    err,
+    assetRoot: env.assetRoot,
+    detail: describeAssetRootFailure(env.assetRoot, err),
+  })
+  await sql.end({ timeout: 5 }).catch(() => {})
+  process.exit(1)
+}
+
+// 6. The image backends. Constructed whether or not a model is reachable: the placeholder always
 //    exists, so `backends.placeholder` is never null and the service is never without a way to
 //    answer a generation request that asked for one.
 const preflight = new Preflight(env.flux, { deadlineMs: env.imageDeadlineMs })
@@ -94,7 +121,7 @@ const backends: BackendSet = {
   placeholder: placeholderBackend(),
 }
 
-// 6. The Lifecycle and its probes, before the routes, because `/readyz` is a route and it needs
+// 7. The Lifecycle and its probes, before the routes, because `/readyz` is a route and it needs
 //    something to report. The service is `starting` from here until `markReady()`, so a balancer
 //    that probes during boot is told the truth rather than a static `{ok:true}`.
 const lifecycle = new Lifecycle({
@@ -134,8 +161,23 @@ lifecycle
     // service. It performs no I/O, so it can never spend money or hang the probe.
     imageBackendProbe(preflight),
   )
+  .addProbe(
+    // HARD, and the contrast with the probe directly above it is the whole reason this one exists.
+    //
+    // The image backend degrades honestly: with no model, brand kits, reads and placeholder
+    // generation all still work, so `soft` — 200 with `state: "degraded"` — is the truth. An
+    // unwritable asset root has no such remainder. Every generation of every kind fails, through
+    // every backend including the placeholder, because they all end at `blobs.put()`. Reporting
+    // that in the `/readyz` body while still answering 200 would leave the replica in the balancer
+    // taking work it cannot finish — the same bug this probe exists to catch, wearing a fix's
+    // clothes. So it is `hard`, and `/readyz` goes 503.
+    //
+    // Step 5 already refused to boot on an unwritable root. This is the root that goes read-only,
+    // full or unmounted afterwards, which no boot check can see.
+    assetRootProbe(env.assetRoot),
+  )
 
-// 7. The queue, before the routes: the generate route enqueues, so it closes over this.
+// 8. The queue, before the routes: the generate route enqueues, so it closes over this.
 const queue = new JobQueue(sql as unknown as JobsSql, { owner: env.instanceId })
 
 const kits = postgresBrandKitStore(sql, SERVICE)
@@ -161,7 +203,7 @@ const requestDeps = {
   },
 }
 
-// 8. Routes. Constructed after the Lifecycle so the health handlers report real state, and after
+// 9. Routes. Constructed after the Lifecycle so the health handlers report real state, and after
 //    the pool so the stores are real rather than a lazily-connected surprise on first request.
 const verifier = new Verifier({ jwksUrl: env.identityJwksUrl, issuer: env.identityIssuer })
 const server = createServer({
@@ -186,9 +228,9 @@ const server = createServer({
   },
 })
 
-// 9. The job runner, started before `listen()`. Background work is claimed under a lease, so a
-//    replica that is draining stops claiming before it stops serving — `shouldClaim` is wired to
-//    the Lifecycle for exactly that.
+// 10. The job runner, started before `listen()`. Background work is claimed under a lease, so a
+//     replica that is draining stops claiming before it stops serving — `shouldClaim` is wired to
+//     the Lifecycle for exactly that.
 const reschedule = rescheduleRecurring(queue, logger)
 const runner = new JobRunner({
   queue,
@@ -223,7 +265,7 @@ registerHandlers(runner, {
 await seedRecurring(queue)
 runner.start()
 
-// 10. Listen. Last of the construction steps, because a socket that accepts before its
+// 11. Listen. Last of the construction steps, because a socket that accepts before its
 //     dependencies exist is a socket that answers 500.
 await new Promise<void>((resolve, reject) => {
   server.once('error', reject)
@@ -231,12 +273,12 @@ await new Promise<void>((resolve, reject) => {
 })
 logger.info('listening', { port: env.port })
 
-// 11. Ready. Only now: the state moves `starting → ready`, `/readyz` starts answering 200, and the
+// 12. Ready. Only now: the state moves `starting → ready`, `/readyz` starts answering 200, and the
 //     balancer is allowed to send traffic. Flipping this before `listen()` would advertise a
 //     replica that has no socket.
 lifecycle.markReady()
 
-// 12. Signal handlers, last of all. Installing them earlier means a SIGTERM arriving mid-boot
+// 13. Signal handlers, last of all. Installing them earlier means a SIGTERM arriving mid-boot
 //     drains a service that was never ready, and the drain races the construction above.
 //     Hooks run in reverse registration order, so the server closes first, then the runner stops
 //     claiming and drains, then the pool closes with nothing left to use it.

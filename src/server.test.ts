@@ -1,5 +1,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { chmod, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import type { AddressInfo } from 'node:net'
 import type { Server } from 'node:http'
 import { SignJWT, generateKeyPair } from 'jose'
@@ -14,6 +17,7 @@ import {
   type GenerationRequester,
   type ReadModel,
 } from './server.ts'
+import { assetRootProbe, checkAssetRoot } from './assets.ts'
 import { BrandKitConflictError, type BrandKit, type BrandKitStore, type CreateBrandKit } from './brandkits.ts'
 import { CreditCapError } from './credits.ts'
 import { Preflight, imageBackendProbe } from './preflight.ts'
@@ -263,6 +267,127 @@ test('THE DIFFERENCE: no usable image model is 200 + degraded, not 503', async (
     assert.equal(body.ready, true)
     assert.equal(body.state, 'degraded')
     assert.equal(body.checks.find((c) => c.name === 'image-backend')?.state, 'warn')
+  })
+})
+
+/* --------------------------------------------------------------- the asset root */
+
+/**
+ * The defect these four cases exist for: `STUDIO_ASSET_ROOT` unset, the fallback resolving to a
+ * root-owned `/app/out` under `USER node`, every generation failing EACCES — and `/readyz`
+ * answering **200** throughout.
+ *
+ * Each case asserts the STATUS CODE, not the body. A probe that reports an unwritable root in the
+ * `/readyz` payload while still answering 200 leaves the replica in the balancer, which is the
+ * original defect with a paragraph of explanation attached.
+ */
+
+/** A temporary directory, removed afterwards even if the case leaves it unreadable. */
+async function withTempRoot(fn: (root: string) => Promise<void>): Promise<void> {
+  const root = await mkdtemp(join(tmpdir(), 'studio-asset-root-'))
+  try {
+    await fn(root)
+  } finally {
+    await chmod(root, 0o700).catch(() => {})
+    await rm(root, { recursive: true, force: true })
+  }
+}
+
+const rootProbeCheck = (body: unknown) =>
+  (body as { checks: { name: string; kind: string; state: string; detail?: string }[] }).checks.find(
+    (c) => c.name === 'asset-root',
+  )
+
+test('a writable asset root passes, and the check leaves nothing behind', async () => {
+  await withTempRoot(async (root) => {
+    // Twice, because the second run is the one that matters: the check must need the same
+    // permission on the second call as on the first, which is only true if it tears its own
+    // scratch directory down. See WRITE_CHECK_DIR.
+    await checkAssetRoot(root)
+    await checkAssetRoot(root)
+
+    assert.deepEqual(await readdir(root), [], 'the check removes both the file and the directory')
+
+    await withServer({ probes: [assetRootProbe(root)] }, async (h) => {
+      const res = await fetch(`${h.url}/readyz`)
+      assert.equal(res.status, 200)
+      assert.equal(rootProbeCheck(await res.json())?.state, 'pass')
+    })
+  })
+})
+
+test('THE POINT: an unwritable asset root is 503, not a 200 that mentions it', async () => {
+  // Runs as any uid: `mkdir` under a path that goes through a regular FILE is ENOTDIR for root
+  // too. The permission case below is the incident's own errno and needs a non-root uid.
+  await withTempRoot(async (dir) => {
+    const notADirectory = join(dir, 'this-is-a-file')
+    await writeFile(notADirectory, 'x')
+
+    await withServer({ probes: [assetRootProbe(notADirectory)] }, async (h) => {
+      const res = await fetch(`${h.url}/readyz`)
+      assert.equal(res.status, 503, 'the replica must leave the balancer, not merely complain')
+
+      const body = (await res.json()) as { ready: boolean; state: string }
+      assert.equal(body.ready, false)
+
+      const check = rootProbeCheck(body)
+      assert.equal(check?.state, 'fail')
+      // HARD is the assertion. A soft probe reports exactly the same `fail` here and still answers
+      // 200, so the kind — not the state — is what makes the status code correct.
+      assert.equal(check?.kind, 'hard')
+      assert.match(String(check?.detail), /not a directory/)
+    })
+  })
+})
+
+test('THE INCIDENT: a root the process cannot write to is EACCES and 503', async () => {
+  const uid = typeof process.getuid === 'function' ? process.getuid() : -1
+  // Announced rather than silent. Root ignores the mode bits, so this case cannot be run as root
+  // and a green run that skipped it must say which one it was.
+  if (uid === 0) {
+    console.log('skipped as root: chmod cannot make a directory unwritable to uid 0')
+    return
+  }
+
+  await withTempRoot(async (root) => {
+    // r-x: exactly the state `/app/out` was in — the directory exists, is readable, is listable,
+    // and cannot be written to by the uid the image runs as.
+    await chmod(root, 0o500)
+
+    await withServer({ probes: [assetRootProbe(root)] }, async (h) => {
+      const res = await fetch(`${h.url}/readyz`)
+      assert.equal(res.status, 503)
+
+      const check = rootProbeCheck(await res.json())
+      assert.equal(check?.state, 'fail')
+      assert.equal(check?.kind, 'hard')
+      // The sentence an operator gets: the errno's real cause, not `chmod` on a correct path.
+      assert.match(String(check?.detail), /not writable by uid/)
+      assert.match(String(check?.detail), /EVERY generation of every kind/)
+    })
+  })
+})
+
+test('a root that is fine at boot and unwritable later still goes 503', async () => {
+  const uid = typeof process.getuid === 'function' ? process.getuid() : -1
+  if (uid === 0) {
+    console.log('skipped as root: chmod cannot make a directory unwritable to uid 0')
+    return
+  }
+
+  // This is the case the boot assertion in index.ts cannot cover, and the reason the probe exists
+  // as well as the boot check: a volume remounted read-only, or a disk that fills, at 03:00.
+  await withTempRoot(async (root) => {
+    await withServer({ probes: [assetRootProbe(root)] }, async (h) => {
+      assert.equal((await fetch(`${h.url}/readyz`)).status, 200)
+      await chmod(root, 0o500)
+      // THE REGRESSION THIS PINS. A check that kept a scratch directory around would still be
+      // writing into it here and would answer 200 — the root is unwritable and the probe cannot
+      // tell, which is the original defect reintroduced by a check that looked correct.
+      assert.equal((await fetch(`${h.url}/readyz`)).status, 503)
+      await chmod(root, 0o700)
+      assert.equal((await fetch(`${h.url}/readyz`)).status, 200, 'and it recovers without a restart')
+    })
   })
 })
 

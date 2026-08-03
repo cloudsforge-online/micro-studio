@@ -21,6 +21,12 @@ pnpm start
 pnpm check            # typecheck + tests
 ```
 
+**Set `STUDIO_ASSET_ROOT` in any container deploy.** The default `./out` is right on a laptop and
+wrong in the image, where it resolves to a root-owned `/app/out` under `USER node`. The service now
+refuses to start on a root it cannot write to, and `/readyz` answers 503 if the root becomes
+unwritable later — both proved by writing a file and removing it, never by `fs.access`. See
+`.env.example`.
+
 DB tests skip without `STUDIO_TEST_DATABASE_URL` (the name must contain `test`; they truncate).
 The suite runs `--test-concurrency=1` because those tests truncate and `node:test` runs files in
 parallel by default.
@@ -30,6 +36,7 @@ parallel by default.
 | | |
 | --- | --- |
 | `GET /livez` `GET /readyz` `GET /metrics` | Rule 4. Liveness is static; readiness runs the probes |
+| | `postgres` and `asset-root` are **hard** (503); `identity-jwks` and `image-backend` are soft (200 + `degraded`) |
 | `GET /v1/backend` | What it can generate with, and whether it can. Unauthenticated |
 | `POST /v1/brand-kits` · `GET /v1/brand-kits/:id` | |
 | `POST /v1/brand-kits/:id/generate` | **202 + a job.** Reaches no model |
