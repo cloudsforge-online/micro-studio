@@ -74,7 +74,13 @@ USER node
 # run time. There is no ENV line for one here on purpose. AZURE_FOUNDRY_API_KEY in particular is a
 # spend credential and belongs in a secret, never in an image or in `docker inspect`.
 ENV NODE_ENV=production
-EXPOSE 4012
+# 4015 — this service's own default, from `src/env.ts`'s `integer(source, 'PORT', 4015, …)`.
+#
+# It said 4012, which is a port no file in this repository names: `.env.example` says 4015 and
+# `.github/workflows/ci.yml` passes `port: 4015` to the shared workflow, and the shared workflow
+# checks those two against each other but never looks at this line. EXPOSE publishes nothing and
+# binds nothing, so the wrong number cost nobody an outage — it cost whoever read it next.
+EXPOSE 4015
 
 # The health endpoints are for the orchestrator, not for the image: the balancer probes /readyz and
 # the restart policy probes /livez. A HEALTHCHECK here would duplicate that in a second place that
