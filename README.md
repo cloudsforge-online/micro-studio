@@ -4,6 +4,8 @@ The engine behind Forge Create's brand track: brand kits, asset specs, leased ge
 assets whose provenance is complete. It productises the `asset-forge` CLI, and every design
 decision below is traceable to something that CLI cannot do as a service.
 
+Design authority: [`ecosystem/03-repository-responsibilities.md`](https://github.com/cloudsforge-online/micro-docs/blob/main/ecosystem/03-repository-responsibilities.md)
+
 | `asset-forge` today | `studio` |
 | --- | --- |
 | Writes PNGs into sibling working trees with **no record** of the model, prompt, spec or cost | Every asset points at the `generation_jobs` row that made it, `on delete restrict` |
@@ -186,3 +188,10 @@ set -a && . ./.env.local && set +a && STUDIO_LIVE_FLUX=1 pnpm test
 They assert PNG magic bytes, exact dimensions, C2PA presence, and that the hyphenated spelling
 really is a 404 — so if the vendor ever fixes that, the warning can be retired rather than repeated
 for ever.
+
+---
+
+## Provenance
+
+The code in this repository was written by **Claude Opus 5** and **Claude Fable 5**, under
+human direction and review.
