@@ -59,6 +59,15 @@ jobs:
         IDENTITY_JWKS_URL=http://127.0.0.1:4001/.well-known/jwks.json
         IDENTITY_ISSUER=http://127.0.0.1:4001
         OUTBOX_SIGNING_SECRET=ci-only-not-a-real-secret-000000000000
+        # The smoke test runs the image as uid 1000 against a root-owned WORKDIR, so the default
+        # asset root `./out` resolves to `/app/out` and the boot check dies with EACCES — which is
+        # the check working. `src/env.ts` refuses to start on a root it cannot write to because an
+        # unset root once silently 500'd every generation while reporting healthy.
+        #
+        # Given here rather than defaulted in the image on purpose: a writable default would send
+        # generated assets into a container layer, to be lost on the next redeploy. The deployment
+        # is what knows where assets belong, so the deployment is what must say.
+        STUDIO_ASSET_ROOT=/tmp/studio-assets
     secrets:
       # @cloudsforge/* resolves through link:../runtime rather than a registry, so the workflow
       # checks out micro-runtime as a sibling. It is private, so it needs a contents:read token.
