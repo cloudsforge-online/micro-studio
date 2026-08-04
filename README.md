@@ -133,8 +133,14 @@ resource, not of the model.
 
 ### Costs
 
-The response carries `request_meta.cost` in provider units — a flat `3` per image at every size
-probed, from 256² to 1200x630 — and publishes no dollar exchange rate on this surface. So the
+The response carries `request_meta.cost` in provider units. This paragraph used to call it **"a
+flat `3` per image at every size probed, from 256² to 1200x630"**, and the qualifier turned out to
+be doing all the work: **every one of those probes was under a megapixel.** Generating the wallet
+asset set went above that and found the cost is **flat 3.0 only up to roughly 1 MP, and rises to
+7.5 beyond it** — measured across 152 calls totalling 513.0 units.
+
+So it is size-dependent, and a caller planning a large set should budget accordingly rather than
+multiplying by three. The provider publishes no dollar exchange rate on this surface. The
 credit reservation uses `STUDIO_IMAGE_PRICE_USD` (configuration, correctable) and the provider's own
 figure is stored verbatim beside it in `generation_jobs.provider_cost_units`. A dollar rate
 hardcoded in this repository would be a guess nobody could correct.
