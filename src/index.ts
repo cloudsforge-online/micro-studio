@@ -39,7 +39,7 @@ import {
   findAsset,
 } from './assets.ts'
 import { findJob, requestGeneration, GENERATE_KIND } from './generation.ts'
-import { DEFAULT_UPLOAD_QUOTA, storeUpload } from './uploads.ts'
+import { DEFAULT_UPLOAD_QUOTA, changeVisibility, storeUpload } from './uploads.ts'
 import { fluxBackend, placeholderBackend, type BackendSet } from './backend.ts'
 import { Preflight, imageBackendProbe } from './preflight.ts'
 
@@ -225,6 +225,7 @@ const server = createServer({
   uploads: {
     store: (input) =>
       storeUpload({ sql, producer: SERVICE, blobs, quota: DEFAULT_UPLOAD_QUOTA }, input),
+    setVisibility: (input) => changeVisibility({ sql, producer: SERVICE }, input),
   },
   preflight,
   // Queue depth is sampled at scrape time rather than on a timer. There is no `setInterval` in

@@ -19,7 +19,13 @@ import { join } from 'node:path'
 import type postgres from 'postgres'
 import { filesystemBlobStore, findAsset, type Asset } from './assets.ts'
 import { UploadRejected } from './imagebytes.ts'
-import { DEFAULT_UPLOAD_QUOTA, UploadQuotaError, storeUpload, type UploadDeps } from './uploads.ts'
+import {
+  DEFAULT_UPLOAD_QUOTA,
+  UploadQuotaError,
+  changeVisibility,
+  storeUpload,
+  type UploadDeps,
+} from './uploads.ts'
 import { enabled, migrateTestDb, openDb, resetStudio, skip } from './testsupport.ts'
 
 const OWNER = 'user:11111111-1111-4111-8111-111111111111'
@@ -92,9 +98,14 @@ function png(width = 64, height = 48, secret?: string): Buffer {
   ])
 }
 
-const input = (bytes: Buffer, ownerSubject = OWNER) => ({
+const input = (
+  bytes: Buffer,
+  ownerSubject = OWNER,
+  visibility: 'private' | 'public' = 'private',
+) => ({
   bytes,
   ownerSubject,
+  visibility,
   actor: `service:studio-test`,
   correlationId: 'corr-1',
 })
@@ -303,6 +314,65 @@ test('the schema refuses half an anchor', { skip }, async () => {
   ]) {
     await assert.rejects(() => half, /assets_anchor_is_whole/)
   }
+})
+
+/* ------------------------------------------------------------------ visibility */
+
+test('an upload is private unless it was explicitly published', { skip }, async () => {
+  const quiet = await storeUpload(deps(), input(png(), OWNER, 'private'))
+  assert.equal(quiet.asset.visibility, 'private')
+  assert.equal(quiet.asset.publishedAt, null)
+
+  const loud = await storeUpload(deps(), input(png(64, 49), OWNER, 'public'))
+  assert.equal(loud.asset.visibility, 'public')
+  assert.ok(loud.asset.publishedAt, 'a public asset must record when it became public')
+})
+
+test('publishing is idempotent and does not move the original publication time', { skip }, async () => {
+  const stored = await storeUpload(deps(), input(png()))
+  const published = await changeVisibility(deps(), {
+    assetId: stored.asset.id,
+    visibility: 'public',
+    actor: 'user:someone',
+    correlationId: 'c',
+  })
+  assert.equal(published?.visibility, 'public')
+  const firstPublishedAt = published?.publishedAt
+  assert.ok(firstPublishedAt)
+
+  const again = await changeVisibility(deps(), {
+    assetId: stored.asset.id,
+    visibility: 'public',
+    actor: 'user:someone',
+    correlationId: 'c',
+  })
+  // "Since when have these bytes been fetchable without a token" does not change on a re-publish.
+  assert.equal(again?.publishedAt, firstPublishedAt)
+})
+
+test('unpublishing clears the publication record, as the constraint requires', { skip }, async () => {
+  const stored = await storeUpload(deps(), input(png(), OWNER, 'public'))
+  const hidden = await changeVisibility(deps(), {
+    assetId: stored.asset.id,
+    visibility: 'private',
+    actor: 'user:someone',
+    correlationId: 'c',
+  })
+  assert.equal(hidden?.visibility, 'private')
+  assert.equal(hidden?.publishedAt, null)
+})
+
+test('the schema refuses a public asset with no record of who published it', { skip }, async () => {
+  await assert.rejects(
+    () => sql`
+      insert into assets (origin, owner_subject, kind, format, media_type, declared_width,
+                          declared_height, sizing, storage_url, checksum, byte_size, licence,
+                          visibility)
+      values ('upload', ${OWNER}, 'upload', 'png', 'image/png', 8, 8, 'unknown', 'file:///x',
+              ${'sha256:' + 'c'.repeat(64)}, 1, 'l', 'public')
+    `,
+    /assets_publication_is_recorded/,
+  )
 })
 
 test('a stored upload reports itself unanchored, because nothing can anchor it yet', { skip }, async () => {

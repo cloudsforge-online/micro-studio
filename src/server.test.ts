@@ -19,7 +19,7 @@ import {
   type UploadReceiver,
 } from './server.ts'
 import { UploadRejected } from './imagebytes.ts'
-import { UploadQuotaError, type UploadInput } from './uploads.ts'
+import { UploadQuotaError, type SetVisibilityInput, type UploadInput } from './uploads.ts'
 import { assetRootProbe, checkAssetRoot } from './assets.ts'
 import { BrandKitConflictError, type BrandKit, type BrandKitStore, type CreateBrandKit } from './brandkits.ts'
 import { CreditCapError } from './credits.ts'
@@ -117,6 +117,8 @@ const ASSET: Asset = {
   byteSize: 629_074,
   licence: 'cloudsforge-generated: commercial use permitted; AI-generated, C2PA provenance retained',
   c2pa: true,
+  visibility: 'private',
+  publishedAt: null,
   // Unanchored, because nothing can anchor it: Hearth has no Registry of Authorship contract.
   anchor: { state: 'unanchored', transactionHash: null, blockNumber: null, anchoredAt: null },
   createdAt: '1970-01-01T00:00:01.000Z',
@@ -145,8 +147,21 @@ const UPLOAD: Asset = {
   byteSize: 1_024,
   licence: 'cloudsforge-uploaded: supplied by the uploader',
   c2pa: false,
+  visibility: 'private',
+  publishedAt: null,
   anchor: { state: 'unanchored', transactionHash: null, blockNumber: null, anchoredAt: null },
   createdAt: '1970-01-01T00:00:02.000Z',
+}
+
+/**
+ * The same asset, published. Its bytes are fetchable with NO token at all — which is the whole
+ * reason visibility exists, because a browser sends no Authorization header on an `<img>` tag.
+ */
+const PUBLISHED: Asset = {
+  ...UPLOAD,
+  id: 'asset-public-1',
+  visibility: 'public',
+  publishedAt: '1970-01-01T00:00:03.000Z',
 }
 
 /** The stored bytes the `/bytes` route serves in these tests. */
@@ -210,6 +225,7 @@ interface Harness {
   readonly accepted: RequestGenerationInput[]
   /** Every upload the port received, so a test can assert what reached the pipeline. */
   readonly uploaded: UploadInput[]
+  readonly visibilityChanges: SetVisibilityInput[]
 }
 
 async function withServer(options: Options, fn: (h: Harness) => Promise<void>): Promise<void> {
@@ -230,6 +246,7 @@ async function withServer(options: Options, fn: (h: Harness) => Promise<void>): 
     async findAsset(id) {
       if (id === ASSET.id) return ASSET
       if (id === UPLOAD.id) return UPLOAD
+      if (id === PUBLISHED.id) return PUBLISHED
       return null
     },
     async readBlob(checksum, format) {
@@ -265,11 +282,20 @@ async function withServer(options: Options, fn: (h: Harness) => Promise<void>): 
    * status codes, headers, auth and the mapping of a refusal onto a response.
    */
   const uploaded: UploadInput[] = []
+  const visibilityChanges: SetVisibilityInput[] = []
   const uploads: UploadReceiver = {
     async store(input) {
       if (options.uploadRefuseWith) throw options.uploadRefuseWith
       uploaded.push(input)
-      return { asset: UPLOAD, deduplicated: false, strippedBytes: 12 }
+      return {
+        asset: input.visibility === 'public' ? PUBLISHED : UPLOAD,
+        deduplicated: false,
+        strippedBytes: 12,
+      }
+    },
+    async setVisibility(input) {
+      visibilityChanges.push(input)
+      return input.visibility === 'public' ? PUBLISHED : UPLOAD
     },
   }
 
@@ -289,7 +315,15 @@ async function withServer(options: Options, fn: (h: Harness) => Promise<void>): 
   if (options.ready !== false) lifecycle.markReady()
   const { port } = server.address() as AddressInfo
   try {
-    await fn({ url: `http://127.0.0.1:${port}`, lifecycle, metrics, kits, accepted, uploaded })
+    await fn({
+      url: `http://127.0.0.1:${port}`,
+      lifecycle,
+      metrics,
+      kits,
+      accepted,
+      uploaded,
+      visibilityChanges,
+    })
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()))
   }
@@ -980,6 +1014,108 @@ test("another user's uploaded asset is 404, both as metadata and as bytes", asyn
     const headers = { authorization: `Bearer ${stranger}` }
     assert.equal((await fetch(`${h.url}/v1/assets/${UPLOAD.id}`, { headers })).status, 404)
     assert.equal((await fetch(`${h.url}/v1/assets/${UPLOAD.id}/bytes`, { headers })).status, 404)
+  })
+})
+
+/**
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * VISIBILITY. The pair of tests below is the whole security boundary: a published asset is
+ * fetchable by anyone, and an unpublished one is fetchable by nobody but its owner. If the first
+ * fails the feature does not work; if the SECOND fails, every private upload in the estate is
+ * readable by strangers.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+test('a PUBLISHED asset serves its bytes with no Authorization header at all', async () => {
+  await withServer({}, async (h) => {
+    // No token. This is what an <img src> sends.
+    const res = await fetch(`${h.url}/v1/assets/${PUBLISHED.id}/bytes`)
+    assert.equal(res.status, 200)
+    assert.deepEqual(Buffer.from(await res.arrayBuffer()), UPLOAD_BYTES)
+    assert.equal(res.headers.get('x-content-type-options'), 'nosniff')
+    // Publicly cacheable, because it is public and content-addressed.
+    assert.match(res.headers.get('cache-control') ?? '', /^public,/)
+  })
+})
+
+test('an UNPUBLISHED asset is 401 without a token and 404 to a stranger', async () => {
+  const stranger = await sign({
+    sub: '22222222-2222-4222-8222-222222222222',
+    handle: 'rook',
+    roles: ['player'],
+  })
+  await withServer({}, async (h) => {
+    // No token: the private path still demands one.
+    assert.equal((await fetch(`${h.url}/v1/assets/${UPLOAD.id}/bytes`)).status, 401)
+    // A valid token belonging to somebody else: 404, never 403 — see the enumeration note.
+    const res = await fetch(`${h.url}/v1/assets/${UPLOAD.id}/bytes`, {
+      headers: { authorization: `Bearer ${stranger}` },
+    })
+    assert.equal(res.status, 404)
+  })
+})
+
+test('a private asset is not publicly cacheable', async () => {
+  const token = await sign({ sub: USER, handle: 'ash', roles: ['player'] })
+  await withServer({}, async (h) => {
+    const res = await fetch(`${h.url}/v1/assets/${UPLOAD.id}/bytes`, {
+      headers: { authorization: `Bearer ${token}` },
+    })
+    // `private` keeps it out of a shared cache, which would otherwise be able to hand one user's
+    // image to the next request for the same URL.
+    assert.match(res.headers.get('cache-control') ?? '', /^private,/)
+  })
+})
+
+test('an upload defaults to private, and is public only when explicitly asked', async () => {
+  const token = await sign({ sub: USER, handle: 'ash', roles: ['player'] })
+  await withServer({}, async (h) => {
+    const post = (query: string) =>
+      fetch(`${h.url}/v1/uploads${query}`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${token}` },
+        body: Buffer.from('bytes'),
+      })
+
+    await post('')
+    assert.equal(h.uploaded[0]?.visibility, 'private', 'an upload defaulted to public')
+
+    await post('?visibility=public')
+    assert.equal(h.uploaded[1]?.visibility, 'public')
+
+    // An unrecognised value is refused rather than quietly treated as private: silently
+    // downgrading a caller who meant to publish gives them a broken image they cannot explain.
+    assert.equal((await post('?visibility=world')).status, 400)
+  })
+})
+
+test('the owner can publish and unpublish an asset', async () => {
+  const token = await sign({ sub: USER, handle: 'ash', roles: ['player'] })
+  await withServer({}, async (h) => {
+    const res = await fetch(`${h.url}/v1/assets/${UPLOAD.id}/visibility`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ visibility: 'public' }),
+    })
+    assert.equal(res.status, 200)
+    assert.equal(h.visibilityChanges[0]?.visibility, 'public')
+    assert.equal(h.visibilityChanges[0]?.assetId, UPLOAD.id)
+  })
+})
+
+test('a stranger cannot publish somebody else\'s asset', async () => {
+  const stranger = await sign({
+    sub: '22222222-2222-4222-8222-222222222222',
+    handle: 'rook',
+    roles: ['player'],
+  })
+  await withServer({}, async (h) => {
+    const res = await fetch(`${h.url}/v1/assets/${UPLOAD.id}/visibility`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${stranger}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ visibility: 'public' }),
+    })
+    assert.equal(res.status, 404)
+    assert.equal(h.visibilityChanges.length, 0, 'a stranger reached the visibility change')
   })
 })
 

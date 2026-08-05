@@ -51,7 +51,12 @@ import { SpecError, specFor } from './specs.ts'
 import { isBackendChoice, type BackendChoice } from './backend.ts'
 import { provenanceOf, type GenerationJob, type RequestGenerationInput } from './generation.ts'
 import { MAX_UPLOAD_BYTES, UploadRejected } from './imagebytes.ts'
-import { UploadQuotaError, type UploadInput, type UploadOutcome } from './uploads.ts'
+import {
+  UploadQuotaError,
+  type SetVisibilityInput,
+  type UploadInput,
+  type UploadOutcome,
+} from './uploads.ts'
 import type { Preflight } from './preflight.ts'
 import type { Asset } from './assets.ts'
 
@@ -71,6 +76,7 @@ export interface ReadModel {
 /** Accepting an upload, as this file needs it. A port, for the same reason `GenerationRequester` is. */
 export interface UploadReceiver {
   store(input: UploadInput): Promise<UploadOutcome>
+  setVisibility(input: SetVisibilityInput): Promise<Asset | null>
 }
 
 /**
@@ -608,9 +614,28 @@ function buildRoutes(): Route[] {
      * ══════════════════════════════════════════════════════════════════════════════════════════
      */
     define('GET', '/v1/assets/:id/bytes', async (ctx, deps) => {
-      const principal = await authenticate(ctx, deps)
-      if (principal.kind === 'service') requireScope(principal, READ_SCOPE)
-      const { asset } = await readableAsset(ctx, deps, principal)
+      /**
+       * ════════════════════════════════════════════════════════════════════════════════════════
+       * **A PUBLISHED ASSET IS SERVED WITHOUT A TOKEN. EVERYTHING ELSE STILL NEEDS ONE.**
+       *
+       * The asset is fetched FIRST and the auth decision is made from its visibility, rather than
+       * authenticating first and consulting visibility afterwards. That ordering is what lets an
+       * `<img src>` work at all — see migration 10 — and it is safe precisely because publication
+       * is an explicit, owner-authorised state that defaults to private in the schema.
+       *
+       * A private asset takes exactly the path it took before: authenticate, then check ownership,
+       * then 404 for anything that is not the caller's.
+       * ════════════════════════════════════════════════════════════════════════════════════════
+       */
+      const candidate = await deps.reads.findAsset(idOf(ctx))
+      if (!candidate) throw new NotFoundError('no such asset')
+
+      let asset = candidate
+      if (candidate.visibility !== 'public') {
+        const principal = await authenticate(ctx, deps)
+        if (principal.kind === 'service') requireScope(principal, READ_SCOPE)
+        asset = (await readableAsset(ctx, deps, principal)).asset
+      }
 
       const bytes = await deps.reads.readBlob(asset.checksum, asset.format)
       if (!bytes) {
@@ -635,7 +660,12 @@ function buildRoutes(): Route[] {
           'content-disposition': 'inline',
           'cross-origin-resource-policy': 'cross-origin',
           'referrer-policy': 'no-referrer',
-          'cache-control': 'private, max-age=31536000, immutable',
+          // `private` on an owner-only asset keeps it out of shared caches, where a CDN would
+          // otherwise be able to hand one user's image to the next request for the same URL.
+          'cache-control':
+            asset.visibility === 'public'
+              ? 'public, max-age=31536000, immutable'
+              : 'private, max-age=31536000, immutable',
           // The content address, so a client can verify the bytes it received are the bytes the
           // row claims. Quoted per RFC 7232.
           etag: `"${asset.checksum}"`,
@@ -666,6 +696,10 @@ function buildRoutes(): Route[] {
       const ownerSubject = subjectOf(principal, {
         userId: ctx.url.searchParams.get('userId') ?? undefined,
       })
+      // Private unless the caller SAYS public. An unrecognised value is refused rather than
+      // treated as private, because silently downgrading a caller who meant to publish produces a
+      // broken image they cannot explain.
+      const visibility = visibilityFrom(ctx.url.searchParams.get('visibility'))
 
       const bytes = await readBinary(ctx.req)
 
@@ -674,6 +708,7 @@ function buildRoutes(): Route[] {
         const outcome = await deps.uploads.store({
           bytes,
           ownerSubject,
+          visibility,
           actor: actorOf(principal),
           correlationId: ctx.requestId,
         })
@@ -704,7 +739,43 @@ function buildRoutes(): Route[] {
         done()
       }
     }),
+
+    /**
+     * Publish or unpublish an asset's bytes. The owner's decision, and only the owner's.
+     *
+     * A separate route rather than a field on a general update, because this is the one operation
+     * on an asset that changes who in the world can read it. Making it its own verb means it can be
+     * audited, rate-limited and reasoned about on its own, and it cannot be performed by accident
+     * as part of editing something else.
+     */
+    define('POST', '/v1/assets/:id/visibility', async (ctx, deps) => {
+      const principal = await authenticate(ctx, deps)
+      if (principal.kind === 'service') requireScope(principal, WRITE_SCOPE)
+      // Ownership is checked through the same helper the read path uses, so the two cannot drift.
+      const { asset } = await readableAsset(ctx, deps, principal)
+
+      const body = await readJson(ctx.req)
+      const requested = visibilityFrom(typeof body['visibility'] === 'string' ? body['visibility'] : null)
+
+      const updated = await deps.uploads.setVisibility({
+        assetId: asset.id,
+        visibility: requested,
+        actor: actorOf(principal),
+        correlationId: ctx.requestId,
+      })
+      if (!updated) throw new NotFoundError('no such asset')
+
+      ctx.log.info('asset visibility changed', { assetId: asset.id, visibility: requested })
+      return { status: 200, body: { asset: updated } }
+    }),
   ]
+}
+
+/** `private` unless the caller said `public`. An unrecognised value is a 400, never a default. */
+function visibilityFrom(value: string | null): 'private' | 'public' {
+  if (value === null || value === '' || value === 'private') return 'private'
+  if (value === 'public') return 'public'
+  throw new BadRequestError('visibility must be private or public')
 }
 
 /**

@@ -46,6 +46,15 @@ export type BlobFormat = AssetFormat | UploadFormat
 export type AssetOrigin = 'generated' | 'upload'
 
 /**
+ * Whether the bytes may be fetched without a token. **`private` is the default.**
+ *
+ * See migration 10 for why this exists at all: a browser sends no Authorization header on an
+ * `<img>` tag, so a listing photograph that only its owner may fetch is a broken image to every
+ * buyer. Publication is therefore an explicit act, never a side effect.
+ */
+export type AssetVisibility = 'private' | 'public'
+
+/**
  * The licence recorded on every generated asset.
  *
  * A constant rather than a free-text field: an asset whose licence is whatever the caller typed
@@ -115,6 +124,8 @@ export interface Asset {
   readonly byteSize: number
   readonly licence: string
   readonly c2pa: boolean
+  readonly visibility: AssetVisibility
+  readonly publishedAt: string | null
   readonly anchor: AssetAnchor
   readonly createdAt: string
 }
@@ -365,6 +376,8 @@ interface AssetRow {
   readonly byte_size: string
   readonly licence: string
   readonly c2pa: boolean
+  readonly visibility: string
+  readonly published_at: Date | null
   readonly anchor_tx: string | null
   readonly anchor_block: string | null
   readonly anchored_at: Date | null
@@ -407,6 +420,8 @@ const toAsset = (row: AssetRow): Asset => ({
   byteSize: Number(row.byte_size),
   licence: row.licence,
   c2pa: row.c2pa,
+  visibility: row.visibility as AssetVisibility,
+  publishedAt: row.published_at?.toISOString() ?? null,
   anchor: toAnchor(row),
   createdAt: row.created_at.toISOString(),
 })
@@ -414,7 +429,7 @@ const toAsset = (row: AssetRow): Asset => ({
 const COLUMNS = `id, origin, brand_kit_id, generation_job_id, owner_subject, kind, format,
                  media_type, declared_width, declared_height,
                  actual_width, actual_height, sizing, storage_url, checksum, byte_size, licence,
-                 c2pa, anchor_tx, anchor_block, anchored_at, created_at`
+                 c2pa, visibility, published_at, anchor_tx, anchor_block, anchored_at, created_at`
 
 export interface InsertAsset {
   readonly brandKitId: string
@@ -471,6 +486,10 @@ export interface InsertUpload {
   readonly storageUrl: string
   readonly checksum: string
   readonly byteSize: number
+  /** `private` unless the uploader explicitly asked otherwise. See migration 10. */
+  readonly visibility: AssetVisibility
+  /** Who published it. Required when `visibility` is `public`. */
+  readonly publishedBy: string | null
 }
 
 /**
@@ -490,16 +509,27 @@ export interface InsertUpload {
  * there is no provenance manifest in them.
  */
 export async function insertUpload(sql: Db | Tx, input: InsertUpload): Promise<Asset> {
+  const publishedBy = input.visibility === 'public' ? input.publishedBy : null
+  if (input.visibility === 'public' && !publishedBy) {
+    // `assets_publication_is_recorded` would refuse this anyway; failing here names the caller's
+    // mistake rather than surfacing it as a constraint violation four layers down.
+    throw new Error('a public asset must record who published it')
+  }
+
   const inserted = await sql<AssetRow[]>`
     insert into assets (
       origin, owner_subject, kind, format, media_type,
       declared_width, declared_height, actual_width, actual_height, sizing,
-      storage_url, checksum, byte_size, licence, c2pa
+      storage_url, checksum, byte_size, licence, c2pa,
+      visibility, published_at, published_by
     ) values (
       'upload', ${input.ownerSubject}, 'upload', ${input.format}, ${input.mediaType},
       ${input.width}, ${input.height}, ${input.width}, ${input.height}, 'exact',
       ${input.storageUrl}, ${input.checksum}, ${input.byteSize.toString()}::bigint,
-      ${UPLOADED_LICENCE}, false
+      ${UPLOADED_LICENCE}, false,
+      ${input.visibility},
+      ${input.visibility === 'public' ? sql`now()` : null},
+      ${publishedBy}
     )
     on conflict (owner_subject, checksum) where origin = 'upload' do nothing
     returning ${sql.unsafe(COLUMNS)}
@@ -517,6 +547,36 @@ export async function insertUpload(sql: Db | Tx, input: InsertUpload): Promise<A
   const found = existing[0]
   if (!found) throw new Error('the upload conflicted but no existing row was found')
   return toAsset(found)
+}
+
+/**
+ * Publish or unpublish an asset's bytes.
+ *
+ * Idempotent: publishing an already-public asset keeps the ORIGINAL `published_at` rather than
+ * refreshing it, because the question that column answers is "since when have these bytes been
+ * fetchable without a token", and a re-publish does not change that answer.
+ *
+ * Unpublishing clears both columns, which `assets_publication_is_recorded` requires. It is worth
+ * being plain about what unpublishing does and does not achieve: it stops this service serving the
+ * bytes, and it does nothing whatever about copies already taken. Anything that has been public on
+ * the internet should be assumed to have been copied.
+ */
+export async function setAssetVisibility(
+  sql: Db | Tx,
+  id: string,
+  visibility: AssetVisibility,
+  publishedBy: string,
+): Promise<Asset | null> {
+  const rows = await sql<AssetRow[]>`
+    update assets
+       set visibility   = ${visibility},
+           published_at = ${visibility === 'public' ? sql`coalesce(published_at, now())` : null},
+           published_by = ${visibility === 'public' ? publishedBy : null}
+     where id = ${id}
+    returning ${sql.unsafe(COLUMNS)}
+  `
+  const row = rows[0]
+  return row ? toAsset(row) : null
 }
 
 export async function findAsset(sql: Db, id: string): Promise<Asset | null> {

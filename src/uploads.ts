@@ -23,7 +23,13 @@
  * ══════════════════════════════════════════════════════════════════════════════════════════════
  */
 
-import { insertUpload, type Asset, type AssetBlobStore } from './assets.ts'
+import {
+  insertUpload,
+  setAssetVisibility,
+  type Asset,
+  type AssetBlobStore,
+  type AssetVisibility,
+} from './assets.ts'
 import { MEDIA_TYPES, normalise } from './imagebytes.ts'
 import { withOutbox, type Db, type Emit } from './outbox.ts'
 
@@ -75,6 +81,12 @@ export interface UploadDeps {
 export interface UploadInput {
   readonly bytes: Buffer
   readonly ownerSubject: string
+  /**
+   * Defaults to `private` at every layer that can default it — here, in the route, and in the
+   * schema. An image that is public because nobody said otherwise is the failure this feature is
+   * one mistake away from, so "otherwise" has to be said three times.
+   */
+  readonly visibility: AssetVisibility
   readonly actor: string
   readonly correlationId: string
 }
@@ -128,6 +140,8 @@ export async function storeUpload(deps: UploadDeps, input: UploadInput): Promise
       storageUrl: stored.storageUrl,
       checksum: stored.checksum,
       byteSize: stored.byteSize,
+      visibility: input.visibility,
+      publishedBy: input.visibility === 'public' ? input.actor : null,
     })
 
     // Only on a genuinely new asset. Re-emitting on a deduplicated retry would make every consumer
@@ -180,6 +194,45 @@ async function assertWithinQuota(
   }
 }
 
+export interface SetVisibilityInput {
+  readonly assetId: string
+  readonly visibility: AssetVisibility
+  readonly actor: string
+  readonly correlationId: string
+}
+
+/**
+ * Change who may fetch an asset's bytes, and announce it.
+ *
+ * The event is emitted in the SAME transaction as the update, like every other state change in
+ * this service. A publication that is visible in the database but was never announced is a
+ * consumer — a cache, a moderation queue, a CDN purge — working from a state that no longer
+ * exists, and this is the one state change where that gap has a privacy consequence.
+ */
+export async function changeVisibility(
+  deps: Pick<UploadDeps, 'sql' | 'producer'>,
+  input: SetVisibilityInput,
+): Promise<Asset | null> {
+  return withOutbox(deps.sql, deps.producer, async (tx, emit) => {
+    const asset = await setAssetVisibility(tx, input.assetId, input.visibility, input.actor)
+    if (!asset) return null
+    emit({
+      topic: 'studio.asset.visibility.changed',
+      key: asset.id,
+      payload: {
+        id: asset.id,
+        ownerSubject: asset.ownerSubject,
+        visibility: asset.visibility,
+        publishedAt: asset.publishedAt,
+        checksum: asset.checksum,
+      },
+      actor: input.actor,
+      correlationId: input.correlationId,
+    })
+    return asset
+  })
+}
+
 function emitUploaded(emit: Emit, asset: Asset, input: UploadInput): void {
   emit({
     topic: 'studio.asset.uploaded',
@@ -194,6 +247,7 @@ function emitUploaded(emit: Emit, asset: Asset, input: UploadInput): void {
       width: asset.actualWidth,
       height: asset.actualHeight,
       byteSize: asset.byteSize,
+      visibility: asset.visibility,
       // Stated on the event so a consumer never has to infer it. See `AnchorState`: an uploaded
       // asset has a recorded content address and no chain attestation, and those differ.
       anchorState: asset.anchor.state,

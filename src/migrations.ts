@@ -456,6 +456,63 @@ export const MIGRATIONS: readonly Migration[] = [
         on assets (owner_subject, created_at desc) where owner_subject is not null;
     `,
   },
+  {
+    version: 10,
+    name: 'asset_visibility',
+    /**
+     * Whether an asset's BYTES may be fetched without a token.
+     *
+     * ══════════════════════════════════════════════════════════════════════════════════════════
+     * **THIS EXISTS BECAUSE A BROWSER DOES NOT SEND AN AUTHORIZATION HEADER ON AN `<img>` TAG.**
+     *
+     * Without it the feature cannot work at all, and the ways around it are all worse. A market
+     * listing is public by definition — a buyer who is not the seller has to see the photograph —
+     * but the owner-only ACL on `/v1/assets/:id/bytes` means the only principal who can fetch it is
+     * the one who uploaded it. An `<img src>` carries cookies at best and never a bearer token, so
+     * every listing image would render as a broken icon.
+     *
+     * The alternatives considered and rejected:
+     *
+     *   * **Proxy the bytes through `market`.** Two services serving the same image, two ACLs, two
+     *     sets of security headers, and the second one is the one that drifts. It also puts user
+     *     content back on an app origin, which is the thing serving from studio's own hostname was
+     *     meant to avoid.
+     *   * **Signed URLs.** A signature is a capability with an expiry, which means a listing image
+     *     stops loading when the signature ages out, and a cache cannot hold it. For content that
+     *     is deliberately public this is machinery with no benefit.
+     *   * **Let studio ask market whether a listing is public.** A media service that has to know
+     *     about listings is not a media service.
+     *
+     * So publication is an explicit, owner-authorised state change on the asset itself. **Private
+     * is the default**, in the schema and not merely in the handler, so an asset is never public by
+     * having been forgotten about. Making one public is a deliberate act by the person whose bytes
+     * they are.
+     *
+     * A public asset is readable by anyone holding its id, which is a `gen_random_uuid()` — 122
+     * bits of unguessable. That is the same exposure as every unlisted URL on the internet and is
+     * the intended one: the asset was published.
+     * ══════════════════════════════════════════════════════════════════════════════════════════
+     */
+    up: `
+      alter table assets add column if not exists visibility text not null default 'private';
+
+      alter table assets drop constraint if exists assets_visibility_known;
+      alter table assets add constraint assets_visibility_known
+        check (visibility in ('private', 'public'));
+
+      -- Publishing is recorded, not just flagged. "When did this become public, and who made it
+      -- so" is the first question asked after a mistaken publication, and a bare boolean cannot
+      -- answer either half of it.
+      alter table assets add column if not exists published_at timestamptz;
+      alter table assets add column if not exists published_by text;
+
+      alter table assets drop constraint if exists assets_publication_is_recorded;
+      alter table assets add constraint assets_publication_is_recorded check (
+        (visibility = 'private' and published_at is null and published_by is null)
+        or (visibility = 'public' and published_at is not null and published_by is not null)
+      );
+    `,
+  },
 ]
 
 /**
