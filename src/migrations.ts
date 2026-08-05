@@ -513,6 +513,31 @@ export const MIGRATIONS: readonly Migration[] = [
       );
     `,
   },
+  {
+    version: 11,
+    name: 'cover_kind',
+    /**
+     * `cover` — the tenth asset kind, and the second that is not a brand artefact.
+     *
+     * A new migration rather than an edit to version 6 or 8, for the reason version 8 sets out at
+     * length: migration text is IMMUTABLE once released. Widening the literal in an applied
+     * migration would leave every database that has already run it carrying the older constraint
+     * while `specs.ts` accepted the new kind — so `specFor('cover')` would return a valid spec and
+     * the insert would fail at the database with a violation nobody could predict from the
+     * TypeScript. This widens the list by exactly one, and re-adds the constraint rather than
+     * dropping it, because an unconstrained `kind` accepts a typo as a row and a typo is a job
+     * whose prompt `prompt.ts` has no composition for.
+     */
+    up: `
+      alter table generation_jobs
+        drop constraint if exists generation_jobs_kind_known;
+      alter table generation_jobs
+        add constraint generation_jobs_kind_known check (
+          kind in ('mark', 'wordmark', 'favicon', 'og', 'social', 'banner', 'icon', 'tile',
+                   'world_object', 'cover')
+        );
+    `,
+  },
 ]
 
 /**

@@ -704,6 +704,73 @@ test('THE 400: world_object on a kit with no stylePrompt is refused, not 500', a
   })
 })
 
+/**
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * `cover` IS NOT A BRAND ARTEFACT, AND THESE ASSERT THAT THE PROMPT KNOWS IT.
+ *
+ * The first attempt at Foresight's market covers used `banner`, which is a brand kind carrying
+ * `brandStyle()` AND lettering of the kit name — so a market about a BTC price came back as a
+ * corporate logo with `seed:foresight-8f3a1c` set across it. Nothing in this service reads a
+ * prompt for meaning, so that would have been wrong quietly. These are the assertions that read it.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+test('a cover prompt is an illustration brief, NOT the brand-mark brief', () => {
+  const prompt = buildPrompt({
+    kitName: 'seed:foresight-8f3a1c',
+    accent: '#ff4d00',
+    stylePrompt: 'Will the Coinbase BTC-USD spot price be at or above 70,000 USD',
+    spec: { kind: 'cover', width: 1536, height: 512, format: 'png' },
+  })
+  assert.doesNotMatch(prompt, /Brand mark for a software company/, 'a cover got the brand brief')
+  assert.match(prompt, /Editorial illustration/)
+  // The subject reaches the model.
+  assert.match(prompt, /BTC-USD spot price/)
+})
+
+test('a cover is never lettered, so it cannot invent a price or a date', () => {
+  const prompt = buildPrompt({
+    kitName: 'seed:foresight-8f3a1c',
+    accent: '#ff4d00',
+    stylePrompt: 'Will the Coinbase BTC-USD spot price be at or above 70,000 USD',
+    spec: { kind: 'cover', width: 1536, height: 512, format: 'png' },
+  })
+  // The kit name must NOT be requested as type — that was the visible half of the defect.
+  assert.doesNotMatch(prompt, /Any lettering must read exactly/)
+  assert.doesNotMatch(prompt, /seed:foresight-8f3a1c" — that spelling/)
+  // And numerals are forbidden outright. A generated "$70,000" beside a real market is a figure a
+  // user could act on that nobody wrote and no contract backs.
+  assert.match(prompt, /No text, no lettering, no numerals, no currency symbols/)
+})
+
+test('a cover refuses the outcome, and refuses charts, faces and crests', () => {
+  const prompt = buildPrompt({
+    kitName: 'k',
+    accent: '#ff4d00',
+    stylePrompt: 'Will Arsenal win the 2026-27 English Premier League title?',
+    spec: { kind: 'cover', width: 1536, height: 512, format: 'png' },
+  })
+  // A prediction market must not be illustrated with a line going up: that is a claim about an
+  // outcome nobody has decided, rendered next to real money.
+  assert.match(prompt, /No charts, no graphs, no arrows, no trend lines/)
+  // Several seeded questions name clubs, parties and teams. A hallucinated crest is a trademark
+  // problem, not a stylistic one.
+  assert.match(prompt, /no logos, no brand marks, no flags, no crests/)
+  assert.match(prompt, /without depicting any outcome/)
+})
+
+test('a cover with no subject is refused rather than drawing the kit slug', () => {
+  assert.throws(
+    () =>
+      buildPrompt({
+        kitName: 'seed:foresight-8f3a1c',
+        accent: '#ff4d00',
+        stylePrompt: '   ',
+        spec: { kind: 'cover', width: 1536, height: 512, format: 'png' },
+      }),
+    /no subject/,
+  )
+})
+
 test('and the 500 it replaces was real, not a story about one', async () => {
   // The error is CAUGHT from the real `buildPrompt` rather than reconstructed, so this cannot go
   // stale the way the comment in prompt.ts did. It is a bare `Error`: not SpecError, not

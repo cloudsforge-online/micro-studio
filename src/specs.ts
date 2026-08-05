@@ -55,6 +55,32 @@ export const ASSET_KINDS = [
    * ══════════════════════════════════════════════════════════════════════════════════════════════
    */
   'world_object',
+  /**
+   * A wide header image for a piece of CONTENT — a prediction market, an article, a listing.
+   *
+   * ══════════════════════════════════════════════════════════════════════════════════════════════
+   * **THE SECOND KIND THAT IS NOT A BRAND ARTEFACT, AND IT EXISTS BECAUSE THE OBVIOUS ALTERNATIVE
+   * PRODUCES CONFIDENT NONSENSE.**
+   *
+   * The first attempt at Foresight's market covers used `banner`. That is a brand kind: its style
+   * paragraph is `brandStyle()` — "Brand mark for a software company … legible at 16 pixels" — and
+   * `banner` is in `LETTERED`, so `prompt.ts` also instructs the model to set the KIT NAME as type.
+   * Run "Will the Coinbase BTC-USD spot price be at or above 70,000 USD" through that and what
+   * comes back is a corporate logo with `seed:foresight-8f3a1c` lettered across it. It comes back
+   * looking deliberate, and nothing in this service reads a prompt for meaning, so it would have
+   * been wrong quietly — the same failure `world_object` records one entry above.
+   *
+   * So `cover` takes its own style paragraph and is deliberately NOT in `LETTERED`. That second
+   * part is load-bearing rather than tidy: `NO_TEXT` forbids numerals and currency symbols, and
+   * these covers sit beside markets about prices and dates. A generated banner reading "$70,000"
+   * next to a real market on a platform that custodies money is a number a user could act on that
+   * nobody wrote and no contract backs.
+   *
+   * 1536x512 — three to one, already on the 16-pixel grid FLUX floors to, so `requestSizeFor`
+   * rounds nothing and the delivery is `exact`.
+   * ══════════════════════════════════════════════════════════════════════════════════════════════
+   */
+  'cover',
 ] as const
 
 export type AssetKind = (typeof ASSET_KINDS)[number]
@@ -96,6 +122,8 @@ export const DEFAULT_SIZES: Readonly<Record<AssetKind, { width: number; height: 
     tile: { width: 512, height: 512 },
     /** 23-tessera.md §2.1. One tile of floor, three tiles of headroom. */
     world_object: { width: 512, height: 512 },
+    /** 3:1, and both edges divide by 16, so the delivery is exact rather than floored. */
+    cover: { width: 1536, height: 512 },
   })
 
 /** Bounds on a caller-supplied size. Generous, but a spec is interpolated into a raster buffer. */

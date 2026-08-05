@@ -582,6 +582,14 @@ function buildRoutes(): Route[] {
           'a world_object needs a description of the object to make: set stylePrompt on the brand kit',
         )
       }
+      // Same requirement, same reason: a cover is an illustration OF a subject, and with none it
+      // would fall back to drawing the kit's name. `buildPrompt` refuses it structurally, which
+      // maps to 500; this is where the caller's mistake becomes the caller's answer.
+      if (spec.kind === 'cover' && kit.stylePrompt.trim().length === 0) {
+        throw new BadRequestError(
+          'a cover needs a subject to illustrate: set stylePrompt on the brand kit',
+        )
+      }
 
       const requested = typeof body['backend'] === 'string' ? body['backend'] : 'auto'
       if (!isBackendChoice(requested)) {
