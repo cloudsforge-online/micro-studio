@@ -73,6 +73,9 @@ function png(options: PngOptions = {}): Buffer {
 /** A byte sequence that would be a latitude in a real EXIF block. Asserted absent after stripping. */
 const GPS_MARKER = Buffer.from('GPSLatitude+51.5074', 'latin1')
 
+/** A string appended AFTER the end-of-image marker, asserted absent from the stripped output. */
+const FIXTURE_TRAILER = 'appended-after-the-image-GPS-51.5074'
+
 function jpegSegment(marker: number, body: Buffer): Buffer {
   const head = Buffer.alloc(4)
   head[0] = 0xff
@@ -406,6 +409,36 @@ test('WebP EXIF and XMP chunks are removed and the VP8X flags are cleared with t
   assert.equal(result.bytes.readUInt32LE(4), result.bytes.length - 8, 'the RIFF size is wrong')
   assert.equal(result.width, 64)
   assert.equal(result.height, 48)
+})
+
+test('data appended after a JPEG end-of-image marker is discarded', () => {
+  // The polyglot case, and the second-EXIF-block case. PNG has always stopped at IEND and WebP
+  // rebuilds from parsed chunks, so both discarded this; JPEG kept it until the tail was cut at
+  // EOI. Everything a stripper exists to remove can be appended here.
+  const appended = Buffer.concat([
+    jpeg({ withExif: true }),
+    Buffer.from('PK\x03\x04', 'latin1'),
+    Buffer.from(`trailing ${FIXTURE_TRAILER}`, 'latin1'),
+  ])
+  const result = normalise(appended)
+  assert.ok(!result.bytes.includes(Buffer.from(FIXTURE_TRAILER, 'latin1')), 'the tail survived')
+  assert.ok(!result.bytes.includes(Buffer.from('PK\x03\x04', 'latin1')), 'an archive was appended')
+  // The EOI itself is KEPT — a JPEG without one upsets several decoders.
+  assert.deepEqual([...result.bytes.subarray(result.bytes.length - 2)], [0xff, 0xd9])
+  // And the picture still reads.
+  assert.equal(result.width, 64)
+  assert.equal(result.height, 48)
+})
+
+test('a JPEG with no end-of-image marker is kept rather than thrown away', () => {
+  // Truncated, not hostile. Discarding the only copy of somebody's photograph because its last two
+  // bytes are missing helps nobody, and `normalise` re-measures afterwards, so a file too damaged
+  // to read is still refused on its own merits.
+  const whole = jpeg()
+  const truncated = whole.subarray(0, whole.length - 2)
+  const result = normalise(truncated)
+  assert.equal(result.width, 64)
+  assert.ok(result.bytes.includes(Buffer.from([0x12, 0x34, 0x56])), 'the scan data was lost')
 })
 
 test('stripping is idempotent — a normalised image normalises to itself', () => {
