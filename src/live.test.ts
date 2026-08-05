@@ -32,6 +32,7 @@ const apiKey = process.env['AZURE_FOUNDRY_API_KEY']?.trim() ?? ''
 const model = process.env['STUDIO_IMAGE_MODEL']?.trim() || 'FLUX.2-pro'
 const imagePath =
   process.env['AZURE_FOUNDRY_IMAGE_PATH']?.trim() || '/providers/blackforestlabs/v1/flux-2-pro'
+const apiVersion = process.env['AZURE_FOUNDRY_API_VERSION']?.trim() || '2025-04-01-preview'
 
 const live = process.env['STUDIO_LIVE_FLUX'] === '1' && endpoint.length > 0 && apiKey.length > 0
 
@@ -43,6 +44,7 @@ const config: FluxConfig = {
   endpoint: endpoint.replace(/\/+$/, ''),
   apiKey,
   imagePath,
+  apiVersion,
   model,
   fallbackModel: process.env['STUDIO_IMAGE_FALLBACK_MODEL']?.trim() ?? '',
 }

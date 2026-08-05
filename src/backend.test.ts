@@ -172,7 +172,16 @@ test('THE TRAP: the request body always carries `model`, even though the path na
     assert.equal(sent.body['aspect_ratio'], undefined)
     assert.equal(sent.body['size'], undefined)
     assert.equal(sent.headers['api-key'], 'test-key-0000000000000000000000000000')
-    assert.match(sent.url, /^\/providers\/blackforestlabs\/v1\/flux-2-pro$/)
+    assert.match(sent.url, /^\/providers\/blackforestlabs\/v1\/flux-2-pro\?/)
+    // ══════════════════════════════════════════════════════════════════════════════════════════
+    // **`api-version` IS ON THE WIRE.** This assertion is the one that would have saved forty
+    // assets. Without the parameter the live resource answers 404 to a correctly-spelled model at
+    // a correctly-spelled path with a valid key — indistinguishable from a model that was never
+    // deployed, which is precisely how it was read for this service's entire history while every
+    // test in this file stayed green. Asserting the path alone is what made that possible, so the
+    // path assertion above is deliberately no longer anchored at the end.
+    // ══════════════════════════════════════════════════════════════════════════════════════════
+    assert.match(sent.url, /[?&]api-version=2025-04-01-preview(&|$)/, 'api-version is mandatory')
   })
 })
 

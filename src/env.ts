@@ -177,6 +177,23 @@ function providerPath(source: Source, name: string, fallback: string): string {
   return raw
 }
 
+/**
+ * An Azure `api-version`, e.g. `2025-04-01-preview`.
+ *
+ * Shape-checked rather than taken as free text because it is interpolated into every image URL,
+ * and because the one thing worse than a wrong version is a version containing a `&` that silently
+ * appends a parameter nobody wrote.
+ */
+function apiVersion(source: Source, name: string, fallback: string): string {
+  const raw = optional(source, name, fallback)
+  if (!/^\d{4}-\d{2}-\d{2}(-preview)?$/.test(raw)) {
+    throw new EnvError(
+      `${name} must look like 2025-04-01 or 2025-04-01-preview (got ${raw.slice(0, 40)})`,
+    )
+  }
+  return raw
+}
+
 /** Dollars in, integer micro-dollars out. Money is never a float in this service. */
 function usdMicros(source: Source, name: string, fallbackDollars: number): bigint {
   const raw = source[name]?.trim()
@@ -195,6 +212,18 @@ export interface FluxConfig {
   readonly apiKey: string
   /** `/providers/blackforestlabs/v1/flux-2-pro`. Named separately from the model — see below. */
   readonly imagePath: string
+  /**
+   * `2025-04-01-preview`. **Mandatory, and its absence is silent.**
+   *
+   * Without this query parameter the resource answers `404` to a correctly-spelled model at a
+   * correctly-spelled path with a valid key — which reads exactly like a model that was never
+   * deployed, and was read that way for this service's entire history. See trap 0 in
+   * `backend.ts`'s header for the evidence.
+   *
+   * Configurable because Azure retires preview versions on a schedule: pinning it in source would
+   * turn a deprecation into an outage that needs a release to fix.
+   */
+  readonly apiVersion: string
   /**
    * The primary model, sent in the request BODY. `FLUX.2-pro`.
    *
@@ -276,6 +305,40 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
         'a half-configured resource fails as an unreadable 401',
     )
   }
+  const configuredImagePath = providerPath(
+    source,
+    'AZURE_FOUNDRY_IMAGE_PATH',
+    '/providers/blackforestlabs/v1/flux-2-pro',
+  )
+
+  /**
+   * ══════════════════════════════════════════════════════════════════════════════════════════════
+   * **THE ENDPOINT MAY ALREADY CARRY THE PROVIDER PATH, AND CONCATENATING IT TWICE IS A 404 THAT
+   * READS AS "NO MODEL DEPLOYED".**
+   *
+   * Azure's portal offers a "Target URI" for a deployment that is the FULL path —
+   * `https://<resource>.services.ai.azure.com/providers/blackforestlabs/v1/flux-2-pro` — and that
+   * is what a person copying from the portal pastes into `AZURE_FOUNDRY_ENDPOINT`. It is the
+   * obvious thing to paste and it is not wrong; it is simply a different half of the same URL.
+   *
+   * Concatenating it with `imagePath` produces `…/flux-2-pro/providers/blackforestlabs/v1/
+   * flux-2-pro`, which the resource answers **404**. `preflight.ts` then reports "no configured
+   * model is deployed", the placeholder takes over, and every asset comes out an unlabelled
+   * stand-in — the exact failure mode that produced 40 placeholder assets with an empty `model`
+   * column and no test anywhere going red.
+   *
+   * So the two shapes are reconciled here, once, rather than defended against at the call site.
+   * Refusing the longer form outright was considered and rejected: both are legitimate spellings
+   * of one address, exactly one final URL is correct either way, and a boot failure over a paste
+   * that was reasonable would be this service being pedantic about something it can simply resolve.
+   * What it must NOT do is silently build a wrong URL, which is what it did before.
+   * ══════════════════════════════════════════════════════════════════════════════════════════════
+   */
+  const endpointOrigin =
+    fluxEndpoint && fluxEndpoint.endsWith(configuredImagePath)
+      ? fluxEndpoint.slice(0, -configuredImagePath.length)
+      : fluxEndpoint
+
   const model = modelName(source, 'STUDIO_IMAGE_MODEL', fluxEndpoint ? 'FLUX.2-pro' : '')
   if (fluxEndpoint && !model) {
     throw new EnvError('STUDIO_IMAGE_MODEL is required when AZURE_FOUNDRY_ENDPOINT is set')
@@ -302,13 +365,13 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
 
     flux: fluxEndpoint
       ? {
-          endpoint: fluxEndpoint,
+          // The ORIGIN, with the provider path removed if the deploy pasted a full target URI.
+          endpoint: endpointOrigin,
           apiKey: fluxKey,
-          imagePath: providerPath(
-            source,
-            'AZURE_FOUNDRY_IMAGE_PATH',
-            '/providers/blackforestlabs/v1/flux-2-pro',
-          ),
+          imagePath: configuredImagePath,
+          // The default is the version this estate's resource was verified against by a real
+          // generation, not a guess from documentation.
+          apiVersion: apiVersion(source, 'AZURE_FOUNDRY_API_VERSION', '2025-04-01-preview'),
           model,
           fallbackModel,
         }

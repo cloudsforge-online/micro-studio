@@ -128,6 +128,75 @@ test('a trailing slash on the endpoint is stripped, because it 404s like a missi
   assert.equal(env.flux?.endpoint, 'https://test01eastus01.services.ai.azure.com')
 })
 
+/**
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * THE TWO CASES THAT PRODUCED FORTY PLACEHOLDER ASSETS. Both are configuration shapes that built
+ * a wrong URL, answered 404, and were read as "no model is deployed" — while every test was green.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+test('AN ENDPOINT THAT ALREADY CARRIES THE PROVIDER PATH IS NOT CONCATENATED TWICE', () => {
+  // Azure's portal offers the deployment's full Target URI, and that is what a person pastes.
+  // Doubling it produces `…/flux-2-pro/providers/blackforestlabs/v1/flux-2-pro`, a 404 that reads
+  // exactly like an undeployed model. This is the live estate's own secret shape.
+  const env = loadEnv(
+    withEnv({
+      AZURE_FOUNDRY_ENDPOINT:
+        'https://test01cloud01.services.ai.azure.com/providers/blackforestlabs/v1/flux-2-pro',
+      AZURE_FOUNDRY_API_KEY: 'a-real-looking-key-0000000000000000',
+    }),
+  )
+  assert.equal(env.flux?.endpoint, 'https://test01cloud01.services.ai.azure.com')
+  assert.equal(env.flux?.imagePath, '/providers/blackforestlabs/v1/flux-2-pro')
+  // The two halves compose to exactly one correct URL, whichever shape the deploy supplied.
+  assert.equal(
+    `${env.flux?.endpoint}${env.flux?.imagePath}`,
+    'https://test01cloud01.services.ai.azure.com/providers/blackforestlabs/v1/flux-2-pro',
+  )
+})
+
+test('the origin form and the full-target-URI form produce identical configuration', () => {
+  const key = 'a-real-looking-key-0000000000000000'
+  const origin = loadEnv(
+    withEnv({
+      AZURE_FOUNDRY_ENDPOINT: 'https://test01cloud01.services.ai.azure.com',
+      AZURE_FOUNDRY_API_KEY: key,
+    }),
+  )
+  const full = loadEnv(
+    withEnv({
+      AZURE_FOUNDRY_ENDPOINT:
+        'https://test01cloud01.services.ai.azure.com/providers/blackforestlabs/v1/flux-2-pro',
+      AZURE_FOUNDRY_API_KEY: key,
+    }),
+  )
+  assert.deepEqual(origin.flux, full.flux, 'two spellings of one address must configure the same')
+})
+
+test('api-version is defaulted, shape-checked, and cannot smuggle a second parameter', () => {
+  const base = {
+    AZURE_FOUNDRY_ENDPOINT: 'https://test01cloud01.services.ai.azure.com',
+    AZURE_FOUNDRY_API_KEY: 'a-real-looking-key-0000000000000000',
+  }
+  // Defaulted to the version a real generation was verified against, not to a documented guess.
+  assert.equal(loadEnv(withEnv(base)).flux?.apiVersion, '2025-04-01-preview')
+  assert.equal(
+    loadEnv(withEnv({ ...base, AZURE_FOUNDRY_API_VERSION: '2024-05-01-preview' })).flux?.apiVersion,
+    '2024-05-01-preview',
+  )
+  // An EMPTY value is not in this list on purpose: unset and empty both mean "use the default",
+  // which is how every other optional variable in this file behaves. Refusing it here would make
+  // a blank line in an env file a boot failure.
+  assert.equal(loadEnv(withEnv({ ...base, AZURE_FOUNDRY_API_VERSION: '' })).flux?.apiVersion, '2025-04-01-preview')
+  // A value carrying `&` would append a parameter nobody wrote to every image request.
+  for (const bad of ['latest', '2025-04-01&x=1', 'v1', '2025-4-1']) {
+    assert.throws(
+      () => loadEnv(withEnv({ ...base, AZURE_FOUNDRY_API_VERSION: bad })),
+      EnvError,
+      `${JSON.stringify(bad)} was accepted as an api-version`,
+    )
+  }
+})
+
 test('an image path must be absolute and must not end in a slash', () => {
   const base = {
     AZURE_FOUNDRY_ENDPOINT: 'https://test01eastus01.services.ai.azure.com',

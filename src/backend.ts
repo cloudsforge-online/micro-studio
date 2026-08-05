@@ -9,7 +9,9 @@
  * **THE VERIFIED CONTRACT.** Every line here was confirmed against the live resource, and three
  * of them contradict what the URL implies.
  *
- *     POST {endpoint}{imagePath}          e.g. …/providers/blackforestlabs/v1/flux-2-pro
+ *     POST {endpoint}{imagePath}?api-version={apiVersion}
+ *                                         e.g. …/providers/blackforestlabs/v1/flux-2-pro
+ *                                              ?api-version=2025-04-01-preview
  *     api-key: <key>
  *     content-type: application/json
  *     {"model":"FLUX.2-pro","prompt":"…","output_format":"png","width":1024,"height":384}
@@ -18,6 +20,24 @@
  *
  *     The cost is NOT flat at every size: 3 per image up to roughly 1MP, measured at 4.5 for a
  *     1920×768 (the Aetherholm hero). Read request_meta.cost rather than assuming.
+ *
+ * 0. **`api-version` IS MANDATORY, AND OMITTING IT IS WHY THIS SERVICE HAD NEVER GENERATED AN
+ *    IMAGE.** It is numbered zero because it precedes every other trap here: without the query
+ *    parameter the resource answers **`404`** to a correctly-spelled model at a correctly-spelled
+ *    path with a valid key — indistinguishable, from the client's side, from a model that was
+ *    never deployed. That is exactly how it was read. `preflight.ts` reported "no configured model
+ *    is deployed", the placeholder backend took over as designed, and **all 40 assets this estate
+ *    ever produced were placeholders with an empty `model` column** while every test stayed green.
+ *
+ *    Proved by driving it: ten model spellings across three hosts and five routes all returned
+ *    404, and the control plane simultaneously reported `FLUX.2-pro` deployed, `Succeeded`, with
+ *    `imageGenerations: true`. The single difference between the failing call and the working one
+ *    is `?api-version=2025-04-01-preview`.
+ *
+ *    It is CONFIGURABLE rather than hardcoded because Azure retires preview versions on a
+ *    schedule, and a pinned constant here would turn a deprecation into an outage nobody could
+ *    fix without a release. It is REQUIRED rather than optional because the failure it prevents is
+ *    silent.
  *
  * 1. **`model` is REQUIRED in the body**, even though the path already names the model. Omitting
  *    it is `400 {"error":{"code":"no_model_name"}}`. This is the single most surprising thing
@@ -421,7 +441,10 @@ export function fluxBackend(config: FluxConfig, deps: BackendDeps = {}): ImageBa
   const deadlineMs = deps.deadlineMs ?? 120_000
   const priceUsdMicros = deps.priceUsdMicros ?? 60_000n
   const models = [config.model, config.fallbackModel].filter((name): name is string => name.length > 0)
-  const url = `${config.endpoint}${config.imagePath}`
+  // `api-version` is not optional. See trap 0 in the file header: without it this resource answers
+  // 404 to a correctly-spelled model, which is how this service spent its entire history serving
+  // placeholders while believing no model was deployed.
+  const url = `${config.endpoint}${config.imagePath}?api-version=${encodeURIComponent(config.apiVersion)}`
 
   return {
     name: 'flux',

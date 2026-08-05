@@ -135,6 +135,18 @@ export function registerServiceMetrics(metrics: Metrics): Metrics {
       labels: ['reason'],
     })
     .register({
+      /**
+       * A generation the caller did not ask to be a placeholder that WAS one.
+       *
+       * The counter that would have caught the placeholder era: 40 assets, empty model column,
+       * every test green. See the warning in `generation.ts`'s `runGeneration`.
+       */
+      name: 'studio_generations_fell_back_total',
+      help: 'Generations served by a backend the caller did not request',
+      kind: 'counter',
+      labels: ['requested', 'served'],
+    })
+    .register({
       name: 'studio_uploads_accepted_total',
       help: 'User image uploads stored',
       kind: 'counter',

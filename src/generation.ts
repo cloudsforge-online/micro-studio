@@ -246,6 +246,11 @@ export interface RunDeps {
   readonly blobs: AssetBlobStore
   readonly preflight: Preflight
   readonly logger: Logger
+  /**
+   * Optional so a test can drive the pipeline without a registry. See the fallback warning in
+   * `runGeneration` for why the counter exists at all.
+   */
+  readonly metrics?: { increment(name: string, labels?: Record<string, string>): void }
 }
 
 export interface RunOutcome {
@@ -378,6 +383,47 @@ export async function runGeneration(
       bytes: stored.byteSize,
       c2pa: result.c2pa,
     })
+
+    /**
+     * ══════════════════════════════════════════════════════════════════════════════════════════
+     * **A SILENT FALLBACK IS THE DEFECT THAT COST THIS ESTATE FORTY ASSETS.**
+     *
+     * Every one of the 40 assets studio had ever produced was made by the placeholder backend with
+     * an EMPTY `model` column, on an estate that believed it was generating art. The information
+     * was always there — `attempts` recorded the FLUX 404 on every job — but nothing ever compared
+     * what was RECORDED against what was CONFIGURED, so a service degrading exactly as designed
+     * looked identical to a service working.
+     *
+     * This is that comparison, and it fires on the success path rather than the failure path,
+     * because the whole problem is that these jobs SUCCEEDED. `warn`, not `info`: a fallback is an
+     * outcome somebody has to decide about, and burying it at `info` beside the ordinary
+     * completion line is what made it invisible the first time.
+     *
+     * The counter matters more than the log. A log line is something a person has to be looking
+     * for; a counter with a `from` label is something an alert can be built on, and this estate
+     * runs beacon and lantern precisely so that it can be.
+     * ══════════════════════════════════════════════════════════════════════════════════════════
+     */
+    if (job.backendChoice !== 'placeholder' && result.backend === 'placeholder') {
+      const refused = result.attempts.filter((attempt) => attempt.backend !== 'placeholder')
+      deps.metrics?.increment('studio_generations_fell_back_total', {
+        requested: job.backendChoice,
+        served: result.backend,
+      })
+      deps.logger.warn(
+        'a generation the caller did not ask to be a placeholder WAS one — an image model is ' +
+          'configured or was expected, and it did not serve. The asset is a labelled placeholder ' +
+          'and its model column is empty.',
+        {
+          generationJobId: job.id,
+          requestedBackend: job.backendChoice,
+          servedBackend: result.backend,
+          // The refusals, verbatim. This is the evidence that says WHY, and it is the thing
+          // nobody read for forty assets.
+          refusedAttempts: refused,
+        },
+      )
+    }
     return finished
   } catch (err) {
     if (err instanceof ImageBackendError) deps.preflight.observe(err.attempts)

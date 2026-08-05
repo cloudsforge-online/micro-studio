@@ -192,6 +192,7 @@ const runDeps = {
   blobs,
   preflight,
   logger: logger.child({ job: GENERATE_KIND }),
+  metrics,
 }
 
 const requestDeps = {

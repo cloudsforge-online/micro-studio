@@ -66,6 +66,7 @@ export function fluxConfigFor(
     endpoint,
     apiKey: 'test-key-0000000000000000000000000000',
     imagePath: '/providers/blackforestlabs/v1/flux-2-pro',
+    apiVersion: '2025-04-01-preview',
     model: 'FLUX.2-pro',
     fallbackModel: '',
     ...overrides,
