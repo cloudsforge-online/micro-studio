@@ -31,7 +31,7 @@
  */
 
 import { hostname } from 'node:os'
-import { assertGeneratedSecret } from '@cloudsforge/secrets'
+import { assertGeneratedSecret, assertOpaqueSecret } from '@cloudsforge/secrets'
 
 /**
  * The service's own name. A constant rather than a variable: it is a property of the repository,
@@ -48,24 +48,6 @@ export class EnvError extends Error {
   }
 }
 
-/**
- * Values that must never be accepted. The list is short on purpose: it holds the strings that
- * actually appear in this repository's own `.env.example` and compose files, because those are
- * the ones that get copied into a deployment by someone in a hurry.
- */
-const PLACEHOLDERS = new Set([
-  'changeme',
-  'change-me',
-  'placeholder',
-  'secret',
-  'token',
-  'dev-secret',
-  'dev-outbox-signing-secret',
-  'replace-me',
-  'replace-with-a-real-secret',
-  'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
-])
-
 type Source = Readonly<Record<string, string | undefined>>
 
 function required(source: Source, name: string): string {
@@ -74,43 +56,31 @@ function required(source: Source, name: string): string {
   return value
 }
 
-function requiredSecret(source: Source, name: string, minLength = 24): string {
-  const value = required(source, name)
-  if (PLACEHOLDERS.has(value.toLowerCase())) {
-    throw new EnvError(`${name} is set to a known placeholder — generate a real secret`)
-  }
-  // Length is a proxy for entropy and the only one available here. It is set above the point at
-  // which a human-chosen string is plausible, so a memorable password fails this check too.
-  if (value.length < minLength) {
-    throw new EnvError(`${name} must be at least ${minLength} characters (got ${value.length})`)
-  }
-  return value
-}
-
 /**
  * The estate's shared event-bus HMAC key, held to a shape rather than to a deny-list.
  *
- * `requiredSecret` above cannot be the guard for this one. It refuses a fixed list of exact
- * strings and anything under 24 characters, and the value that sat on 54 lines of a PUBLIC compose
- * file — `estate-only-outbox-secret-00000000000000` — was on no list and was 40 characters, so it
- * passed every service in the estate (micro-org #142). A check that could not fail read as the
- * absence of a problem, and it was live on 44 containers across both networks.
+ * THE LOCAL `requiredSecret` AND `PLACEHOLDERS` ARE GONE RATHER THAN KEPT IN FRONT. They refused a
+ * fixed list of exact strings and anything under 24 characters, and the value that sat on 54 lines
+ * of a PUBLIC compose file — `estate-only-outbox-secret-00000000000000` — was on no list and was 40
+ * characters, so it passed every service in the estate (micro-org #142). A check that could not
+ * fail read as the absence of a problem, and it was live on 44 containers across both networks.
  *
  * `assertGeneratedSecret` asserts what a placeholder cannot have: the base64 or hex alphabet (no
  * hyphens — every placeholder this estate wrote had one), 32 decoded BYTES rather than 24
  * keystrokes, and a measured Shannon entropy floor. It has no NODE_ENV exemption and no escape
  * hatch, so CI generates a real value per run rather than being let through.
  *
- * `required` rather than `requiredSecret`, deliberately: the weaker checks are a strict subset of
+ * `required` in front of it and nothing else, deliberately: the deleted checks were a strict subset of
  * the stronger ones, and running them first would answer a 40-character placeholder with "must be
  * at least 24 characters" — a message that is true, useless, and points the operator at the wrong
  * property.
  *
- * THE FOUNDRY KEY IS NOT HELD TO THIS, and that is a decision rather than an oversight: it is a
- * VENDOR-issued credential, so its alphabet and length are Azure's to choose, and asserting a
- * shape here would refuse a perfectly valid key the day that format changes. `optionalSecret`
- * below keeps the deny-list for it, which is all a value nobody in this estate generates can be
- * held to. The rule applies where the estate itself is the issuer.
+ * THE FOUNDRY KEY IS NOT HELD TO THIS RULE, and that is a decision rather than an oversight: it is
+ * a VENDOR-issued credential, so its alphabet and length are Azure's to choose, and demanding
+ * base64 of it would refuse a perfectly valid key the day that format changes. It is held to
+ * `assertOpaqueSecret` instead — the markers, a 16-character floor and a 2.0-bit floor, all of
+ * which are alphabet-independent — rather than to the deny-list it used to have. Two classes,
+ * because the estate is the issuer of one of these values and not of the other. See below.
  */
 function requiredSigningSecret(source: Source, name: string): string {
   const value = required(source, name)
@@ -119,17 +89,39 @@ function requiredSigningSecret(source: Source, name: string): string {
 }
 
 /**
- * A secret that may be absent, but must not be a placeholder when it is present.
+ * A THIRD-PARTY secret that may be absent, but must not be a placeholder when it is present.
  *
- * No length floor: an API key's length is the vendor's decision, and inventing a minimum here
- * would refuse a perfectly valid credential the day Azure shortens its format.
+ * ── WHY THIS IS `assertOpaqueSecret` AND NOT THE SIGNING-KEY RULE ABOVE ───────────────────────
+ *
+ * Because the alphabet belongs to Azure. `assertGeneratedSecret` demands base64 or hex and nothing
+ * else, which the estate can insist on for a key it GENERATES itself with `openssl rand`; it has
+ * no standing to demand it of a value a vendor issued. A guard that refuses a working vendor
+ * credential is a guard an operator deletes at 3am, and then the estate has no guard at all.
+ *
+ * Measured on the live estate, both networks, 2026-08-06 — the same key on each:
+ *
+ *     AZURE_FOUNDRY_API_KEY   84 characters, 5.164 bits per character
+ *
+ * It happens to be base64 today. That is Azure's choice this year and not a rule this file may
+ * rely on, which is exactly why the class is opaque rather than generated.
+ *
+ * ── WHAT IS STILL ASSERTABLE, AND IT IS THE PART THAT CATCHES REAL DEFECTS ────────────────────
+ *
+ * The placeholder markers, which are alphabet-independent, plus a floor of 16 characters and a
+ * Shannon floor of 2.0 that rejects `0000…`. The deny-list this replaces held eight exact strings
+ * and no floor at all, so `estate-placeholder-token-0000000000000000` — 40 characters, live in
+ * this estate's compose file under other names — passed it. The marker list refuses that, and
+ * `estate-only-…`, and `ci-only-not-a-real-secret-…`, without knowing anything about Azure's
+ * format. A JWT is refused too: a minted token in a slot read once at boot is dead on the next
+ * restart at the latest (micro-org #222).
+ *
+ * Still no vendor-specific length or prefix rule: inventing one would refuse a perfectly valid
+ * credential the day Azure changes its format.
  */
 function optionalSecret(source: Source, name: string): string {
   const value = source[name]?.trim() ?? ''
   if (value.length === 0) return ''
-  if (PLACEHOLDERS.has(value.toLowerCase())) {
-    throw new EnvError(`${name} is set to a known placeholder — supply the real key or unset it`)
-  }
+  assertOpaqueSecret(name, value)
   return value
 }
 
