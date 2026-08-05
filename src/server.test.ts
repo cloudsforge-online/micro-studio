@@ -1054,6 +1054,29 @@ test('an UNPUBLISHED asset is 401 without a token and 404 to a stranger', async 
   })
 })
 
+test('the bytes route is not an existence oracle for an anonymous caller', async () => {
+  await withServer({}, async (h) => {
+    // A private asset that EXISTS and an id that does not: identical answers to a caller with no
+    // token. If these ever differ, a stranger can enumerate which asset ids are real.
+    const existing = await fetch(`${h.url}/v1/assets/${UPLOAD.id}/bytes`)
+    const absent = await fetch(`${h.url}/v1/assets/does-not-exist/bytes`)
+    assert.equal(existing.status, 401)
+    assert.equal(absent.status, existing.status, 'an unknown id answers differently from a private one')
+
+    // And with a valid token belonging to somebody else, both are 404 rather than 403.
+    const stranger = await sign({
+      sub: '33333333-3333-4333-8333-333333333333',
+      handle: 'wren',
+      roles: ['player'],
+    })
+    const headers = { authorization: `Bearer ${stranger}` }
+    const mine = await fetch(`${h.url}/v1/assets/${UPLOAD.id}/bytes`, { headers })
+    const nothing = await fetch(`${h.url}/v1/assets/does-not-exist/bytes`, { headers })
+    assert.equal(mine.status, 404)
+    assert.equal(nothing.status, 404)
+  })
+})
+
 test('a private asset is not publicly cacheable', async () => {
   const token = await sign({ sub: USER, handle: 'ash', roles: ['player'] })
   await withServer({}, async (h) => {

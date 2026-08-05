@@ -628,10 +628,30 @@ function buildRoutes(): Route[] {
        * ════════════════════════════════════════════════════════════════════════════════════════
        */
       const candidate = await deps.reads.findAsset(idOf(ctx))
-      if (!candidate) throw new NotFoundError('no such asset')
 
-      let asset = candidate
-      if (candidate.visibility !== 'public') {
+      /**
+       * ════════════════════════════════════════════════════════════════════════════════════════
+       * **ONLY A PUBLIC ASSET SHORT-CIRCUITS. EVERYTHING ELSE FALLS THROUGH TO THE AUTHENTICATED
+       * PATH — INCLUDING AN ID THAT DOES NOT EXIST.**
+       *
+       * The obvious shape is `if (!candidate) 404` before the visibility test, and it is wrong. It
+       * answers **404** for an unknown id and **401** for a private one, to a caller holding no
+       * token — so an anonymous stranger can tell the two apart, and that difference is an
+       * existence oracle over every asset in the estate. It is the same defect `assertOwned` avoids
+       * by answering 404 rather than 403, reintroduced one layer earlier.
+       *
+       * Falling through means an unknown id and a private id are **both 401** without a token, and
+       * both **404** with one. A caller learns nothing they were not already entitled to know.
+       *
+       * The ids are `gen_random_uuid()` and enumerating 122 bits is not a threat anybody has. That
+       * is not the reason this is written correctly: an oracle guarded only by the width of an
+       * identifier is an oracle that becomes real the day something starts issuing shorter ones.
+       * ════════════════════════════════════════════════════════════════════════════════════════
+       */
+      let asset: Asset
+      if (candidate?.visibility === 'public') {
+        asset = candidate
+      } else {
         const principal = await authenticate(ctx, deps)
         if (principal.kind === 'service') requireScope(principal, READ_SCOPE)
         asset = (await readableAsset(ctx, deps, principal)).asset
