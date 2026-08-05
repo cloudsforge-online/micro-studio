@@ -48,9 +48,16 @@ jobs:
       postgres-version: '17'
       # The image smoke test boots the real service, and src/env.ts validates its configuration at
       # import — so the container needs the variables it declares, not just a database, or it exits
-      # before it can serve /livez. CI-only NON-secrets: the signing secret only has to clear a
-      # length check and not be a known placeholder, and the identity URLs are never dialled
+      # before it can serve /livez. The identity URLs are CI-only NON-secrets, never dialled
       # because /livez needs no upstream.
+      #
+      # `OUTBOX_SIGNING_SECRET=@generate` asks service-ci.yml for a fresh `openssl rand -base64 48`
+      # per run. It used to be `ci-only-not-a-real-secret-000000000000`, described here as a value
+      # that "only has to clear a length check and not be a known placeholder" — and that
+      # description was the defect. A value of exactly that shape sat in a PUBLIC compose file,
+      # cleared every guard in the estate and was live on 44 containers (micro-org #142). The boot
+      # guard now checks SHAPE and has no CI exemption, so CI holds a real generated secret rather
+      # than a string claiming to be one.
       #
       # Note what is NOT here: no Foundry API key. The image must boot without one, because a
       # deployment that cannot start without a paid credential cannot be smoke-tested — and a smoke
@@ -58,7 +65,7 @@ jobs:
       smoke-env: |
         IDENTITY_JWKS_URL=http://127.0.0.1:4001/.well-known/jwks.json
         IDENTITY_ISSUER=http://127.0.0.1:4001
-        OUTBOX_SIGNING_SECRET=ci-only-not-a-real-secret-000000000000
+        OUTBOX_SIGNING_SECRET=@generate
         # The smoke test runs the image as uid 1000 against a root-owned WORKDIR, so the default
         # asset root `./out` resolves to `/app/out` and the boot check dies with EACCES — which is
         # the check working. `src/env.ts` refuses to start on a root it cannot write to because an
@@ -125,11 +132,17 @@ jobs:
       # No secret may be committed. `.env.example` carries placeholders only.
       #
       # A PLACEHOLDER MUST SAY IT IS ONE, and one that does is not a finding. This check matched on
-      # length alone, so the CI-only value this repository's own workflow hands the image smoke test
-      # — `OUTBOX_SIGNING_SECRET=ci-only-not-a-real-secret-000000000000`, which exists solely to
-      # clear env.ts's 24-character check — was reported as a committed credential. The bespoke
-      # workflow this replaced never tripped it only because it wrote its environment as YAML
-      # `KEY: value` rather than `KEY=value`, which is a difference in punctuation, not in safety.
+      # length alone, so the CI-only value this repository's own workflow used to hand the image
+      # smoke test — `OUTBOX_SIGNING_SECRET=ci-only-not-a-real-secret-000000000000` — was reported
+      # as a committed credential. The bespoke workflow this replaced never tripped it only because
+      # it wrote its environment as YAML `KEY: value` rather than `KEY=value`, which is a difference
+      # in punctuation, not in safety.
+      #
+      # THAT VALUE IS GONE: the smoke test now takes `@generate` and env.ts holds the key to a
+      # SHAPE rather than to a length, because a 40-character placeholder cleared every guard in
+      # the estate while looking checked (micro-org #142). This step is the second half of the same
+      # lesson — it is the reason a real key pasted into `.env.example` would be caught — so it
+      # stays, and it stays pointed at `.github/workflows/` too.
       #
       # The allowlist is the SHAPE of a placeholder rather than one spelling of one word, and it is
       # the same vocabulary micro-org's secret-hygiene.yml settled on after five services failed
@@ -156,17 +169,33 @@ jobs:
           # version of this step and was caught by running it against a deliberately real-looking
           # value; it is the exact shape of the guards in this estate that passed wrongly for
           # months. Everything up to and including the variable name is stripped first.
+          # THE REPORT NAMES THE PLACE AND NEVER THE VALUE. This step used to print the whole
+          # matching line, so the one run that found a real committed credential would have copied
+          # it into a CI log — a log with a wider audience than the file it came from, and one
+          # nobody thinks to rotate. A finding is actionable from `path:line` alone; the truncated
+          # SHA-256 is there so two findings can be told apart, and so an operator can confirm a
+          # rotation landed by comparing digests rather than by pasting secrets around. It matches
+          # how deploy/scripts/check-secret-hygiene.py correlates, for the same reason.
           suspect=''
           while IFS= read -r line; do
             [ -n "$line" ] || continue
+            where=$(printf '%s' "$line" | cut -d: -f1,2)
             value=$(printf '%s' "$line" | sed -E 's/.*(AZURE_FOUNDRY_API_KEY|OUTBOX_SIGNING_SECRET)=//')
-            printf '%s' "$value" | grep -qiE "$placeholder" || suspect="${suspect}${line}"$'\n'
+            # An `if` rather than `cmd && continue`: a trailing `&&` list that fails IS the last
+            # command of the statement, so under `bash -e {0}` it would abort the step on the first
+            # line that turned out to be a legitimate placeholder — the common case.
+            if printf '%s' "$value" | grep -qiE "$placeholder"; then
+              continue
+            fi
+            digest=$(printf '%s' "$value" | sha256sum | cut -c1-12)
+            suspect="${suspect}  ${where}  sha256:${digest}…  (${#value} characters)"$'\n'
           done <<< "$hits"
 
           if [ -n "$suspect" ]; then
-            echo '::error::a credential appears to be committed:'
+            echo '::error::a credential appears to be committed (value withheld deliberately):'
             printf '%s' "$suspect"
-            echo 'If it is a placeholder, say so in the value — ci-only-…, CHANGE_ME, <your-key>.'
+            echo 'Open the file at that line. If it is a placeholder, say so IN THE VALUE —'
+            echo 'ci-only-…, CHANGE_ME, <your-key>. If it is real, rotate it: it is in git history.'
             exit 1
           fi
           echo 'ok: no credential in a committed file'

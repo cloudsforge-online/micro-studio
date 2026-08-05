@@ -31,6 +31,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
+import { randomBytes } from 'node:crypto'
 import { migrateTestDb, openDb, skip } from './testsupport.ts'
 
 const here = dirname(fileURLToPath(import.meta.url))
@@ -57,7 +58,11 @@ function spawnService(
       STUDIO_DATABASE_URL: process.env['STUDIO_TEST_DATABASE_URL'] ?? '',
       IDENTITY_JWKS_URL: 'http://127.0.0.1:4001/.well-known/jwks.json',
       IDENTITY_ISSUER: 'http://127.0.0.1:4001',
-      OUTBOX_SIGNING_SECRET: 'boot-test-not-a-real-secret-000000000000',
+      // GENERATED per run. This is the one test that boots the real `src/env.ts` in a real
+      // process, so a written fixture here would be a boot the deploy cannot reproduce —
+      // the literal that used to sit here reads as a placeholder and is now refused
+      // (micro-org #142).
+      OUTBOX_SIGNING_SECRET: randomBytes(48).toString('base64'),
       LOG_LEVEL: 'info',
       // No Foundry credential: booting must never depend on a spend credential, and a boot test
       // that could spend money is a boot test nobody runs.

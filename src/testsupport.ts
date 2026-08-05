@@ -8,6 +8,7 @@
  * Not a test file itself — it is excluded from the build and contains no `test()` call.
  */
 
+import { randomBytes } from 'node:crypto'
 import postgres from 'postgres'
 import { migrate, type Sql as DbSql } from '@cloudsforge/db'
 import { MIGRATIONS } from './migrations.ts'
@@ -78,5 +79,9 @@ export const BASE_ENV: Readonly<Record<string, string>> = Object.freeze({
   STUDIO_DATABASE_URL: 'postgres://studio:studio@127.0.0.1:5432/studio',
   IDENTITY_JWKS_URL: 'http://127.0.0.1:4001/.well-known/jwks.json',
   IDENTITY_ISSUER: 'http://127.0.0.1:4001',
-  OUTBOX_SIGNING_SECRET: 'a-real-looking-secret-of-sufficient-length',
+  // GENERATED, not written. `assertGeneratedSecret` refuses a typed value, and a fixture
+  // exempt from the rule it is meant to exercise is how the placeholder in micro-org #142
+  // survived every test in the estate. The literal that used to sit here is now refused
+  // twice over: it is not base64, and normalised it reads as a placeholder.
+  OUTBOX_SIGNING_SECRET: randomBytes(48).toString('base64'),
 })

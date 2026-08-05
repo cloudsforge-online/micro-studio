@@ -8,6 +8,7 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { randomBytes } from 'node:crypto'
 import { BASE_ENV } from './testsupport.ts'
 
 /**
@@ -48,9 +49,77 @@ test('a missing required variable names itself', () => {
 test('a placeholder signing secret is refused outright', () => {
   // A default secret in source is not convenient, it is catastrophic: everything derived from it
   // is forgeable by anyone who can read the repository.
+  //
+  // NOT `instanceof EnvError` any more, and that is the change rather than an accident. The
+  // refusal now comes from `@cloudsforge/secrets` as a `SecretError`, and it is deliberately NOT
+  // re-wrapped: nothing in this service branches on the class (`fatalConfig` reads `.message` off
+  // `unknown`), so wrapping would buy nothing and would cost the caller the ability to tell a
+  // secret's shape apart from every other configuration fault. What must hold is the message.
   assert.throws(
     () => loadEnv(withEnv({ OUTBOX_SIGNING_SECRET: 'changeme' })),
-    (err: unknown) => err instanceof EnvError && /placeholder/.test(err.message),
+    (err: unknown) => err instanceof Error && /known placeholder/.test(err.message),
+  )
+})
+
+test('an unset signing secret is a refusal to boot, never a service that signs with nothing', () => {
+  // `policy` was found running with this variable UNSET — measured at zero characters — while its
+  // /livez stayed green. An empty value must reach `required`, not the shape guard, so the message
+  // names the variable rather than describing an alphabet.
+  assert.throws(
+    () => loadEnv(withEnv({ OUTBOX_SIGNING_SECRET: '' })),
+    (err: unknown) => err instanceof EnvError && /OUTBOX_SIGNING_SECRET is required/.test(err.message),
+  )
+  assert.throws(() => loadEnv(withEnv({ OUTBOX_SIGNING_SECRET: '   ' })), /OUTBOX_SIGNING_SECRET is required/)
+})
+
+test('THE VALUE THAT SAT IN A PUBLIC REPOSITORY IS REFUSED, and every near miss with it', () => {
+  // micro-org #142. Each of these cleared the old guard — a deny-list of exact strings plus a
+  // 24-character floor — and each is a real string that was deployed or set in CI, not an invented
+  // one. The first was live on 44 containers across both networks. If a future edit weakens the
+  // floor, it fails against evidence rather than against taste.
+  for (const value of [
+    'estate-only-outbox-secret-00000000000000', // 54 lines of a PUBLIC compose file, 40 chars
+    'ci-only-not-a-real-secret-000000000000', // this repository's own former smoke-env value
+    'K2sN4vQ8xR1wB6tY9zL3mF7hC5jD0pA4', // the estate's former test fixture: 32 chars, 24 bytes
+    '0'.repeat(64), // right alphabet, right length, no entropy
+  ]) {
+    assert.throws(
+      () => loadEnv(withEnv({ OUTBOX_SIGNING_SECRET: value })),
+      (err: unknown) => {
+        // The refusal must not echo the value: the reason this guard exists is that the value was
+        // readable, and a message carrying it moves the secret to the log collector. This service
+        // already treats an assertion as a disclosure channel — see the note about `env.flux`
+        // above — and the same argument applies to an error message.
+        const message = (err as Error).message
+        assert.ok(!message.includes(value), 'the refusal echoed the value')
+        assert.match(message, /OUTBOX_SIGNING_SECRET/)
+        assert.match(message, /openssl rand -base64 48/)
+        return true
+      },
+    )
+  }
+})
+
+test('a generated secret is accepted, in either alphabet', () => {
+  assert.doesNotThrow(() =>
+    loadEnv(withEnv({ OUTBOX_SIGNING_SECRET: randomBytes(48).toString('base64') })),
+  )
+  assert.doesNotThrow(() => loadEnv(withEnv({ OUTBOX_SIGNING_SECRET: randomBytes(32).toString('hex') })))
+})
+
+test('THE FOUNDRY KEY IS NOT HELD TO THE GENERATED SHAPE, because Azure issues it', () => {
+  // The shape guard applies where the ESTATE is the issuer. A vendor credential's alphabet and
+  // length are the vendor's to change, and a guard that refused a valid key the day Azure altered
+  // its format would be removed rather than fixed — taking the outbox guard with it. This service
+  // is verified against a real FLUX 2 Pro deployment, so this is not hypothetical.
+  const vendorish = 'a-real-looking-key-0000000000000000'
+  assert.doesNotThrow(() =>
+    loadEnv(
+      withEnv({
+        AZURE_FOUNDRY_ENDPOINT: 'https://test01eastus01.services.ai.azure.com',
+        AZURE_FOUNDRY_API_KEY: vendorish,
+      }),
+    ),
   )
 })
 
