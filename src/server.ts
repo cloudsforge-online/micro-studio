@@ -71,6 +71,7 @@ export interface ReadModel {
   findAsset(id: string): Promise<Asset | null>
   /** Stored bytes by content address. `null` when this replica does not have them. */
   readBlob(checksum: string, format: string): Promise<Buffer | null>
+  listAssetsForKit(brandKitId: string, limit: number): Promise<readonly Asset[]>
 }
 
 /** Accepting an upload, as this file needs it. A port, for the same reason `GenerationRequester` is. */
@@ -480,10 +481,58 @@ function buildRoutes(): Route[] {
       }
     }),
 
+    /**
+     * The caller's own kits.
+     *
+     * ══════════════════════════════════════════════════════════════════════════════════════════
+     * **THIS EXISTS SO A REPEATED BOOTSTRAP CAN FIND WHAT THE LAST ONE MADE.**
+     *
+     * `deploy/scripts/estate-seed.mjs` states the property it has to have: idempotent, because
+     * bootstrap is re-run several times an hour, and "where a service offers an idempotency key
+     * this uses it; where it does not, this lists and matches first". Studio offered neither — a
+     * kit could be created and fetched by id, and an id is exactly what a fresh seeding run does
+     * not have. Without this route the only way to be idempotent was to remember an id in a file
+     * outside the service, which is a second source of truth about what exists.
+     *
+     * The store method has been here since the beginning; only the route was missing.
+     * ══════════════════════════════════════════════════════════════════════════════════════════
+     */
+    define('GET', '/v1/brand-kits', async (ctx, deps) => {
+      const principal = await authenticate(ctx, deps)
+      if (principal.kind === 'service') requireScope(principal, READ_SCOPE)
+      const owner = subjectOf(principal, { userId: ctx.url.searchParams.get('userId') ?? undefined })
+      const kits = await deps.kits.listForOwner(owner, readLimit(ctx))
+      return { status: 200, body: { brandKits: kits } }
+    }),
+
     define('GET', '/v1/brand-kits/:id', async (ctx, deps) => {
       const principal = await authenticate(ctx, deps)
       if (principal.kind === 'service') requireScope(principal, READ_SCOPE)
       return { status: 200, body: { brandKit: await ownedKit(ctx, deps, principal) } }
+    }),
+
+    /**
+     * The assets generated for one kit.
+     *
+     * The other half of the idempotent bootstrap, and it carries a constraint that is not merely
+     * about tidiness: **FLUX assets already in the tree are permanent and are never regenerated.**
+     * A seeding run that could not see an existing asset would make a second one on every pass —
+     * spending real money each time, and producing a different image for the same content on every
+     * bootstrap. Listing first is what makes "generate only if there is nothing here" expressible.
+     */
+    define('GET', '/v1/brand-kits/:id/assets', async (ctx, deps) => {
+      const principal = await authenticate(ctx, deps)
+      if (principal.kind === 'service') requireScope(principal, READ_SCOPE)
+      // Ownership is decided by the KIT, through the same helper every other kit route uses, so a
+      // caller cannot read another owner's assets by naming their kit.
+      const kit = await ownedKit(ctx, deps, principal)
+      const assets = await deps.reads.listAssetsForKit(kit.id, readLimit(ctx))
+      return {
+        status: 200,
+        body: {
+          assets: assets.map((asset) => ({ ...asset, bytesUrl: `/v1/assets/${asset.id}/bytes` })),
+        },
+      }
     }),
 
     /**
@@ -878,6 +927,26 @@ function actorOf(principal: Principal): string {
 function subjectOf(principal: Principal, body: Record<string, unknown>): string {
   const requested = typeof body['userId'] === 'string' ? body['userId'] : undefined
   return `user:${subjectUserId(principal, requested)}`
+}
+
+/**
+ * `?limit=`, bounded. Defaults low and caps hard.
+ *
+ * An unbounded list route is a way to ask one query to read a table, and the caller who does it is
+ * usually a script that meant to ask for ten. The cap is the schema's protection, not the caller's
+ * good manners.
+ */
+const DEFAULT_LIST_LIMIT = 50
+const MAX_LIST_LIMIT = 200
+
+function readLimit(ctx: RequestContext): number {
+  const raw = ctx.url.searchParams.get('limit')
+  if (raw === null || raw === '') return DEFAULT_LIST_LIMIT
+  const value = Number(raw)
+  if (!Number.isInteger(value) || value < 1 || value > MAX_LIST_LIMIT) {
+    throw new BadRequestError(`limit must be a whole number between 1 and ${MAX_LIST_LIMIT}`)
+  }
+  return value
 }
 
 function idOf(ctx: RequestContext): string {

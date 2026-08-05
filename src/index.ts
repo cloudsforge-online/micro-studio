@@ -37,6 +37,7 @@ import {
   describeAssetRootFailure,
   filesystemBlobStore,
   findAsset,
+  listAssetsForKit,
 } from './assets.ts'
 import { findJob, requestGeneration, GENERATE_KIND } from './generation.ts'
 import { DEFAULT_UPLOAD_QUOTA, changeVisibility, storeUpload } from './uploads.ts'
@@ -219,6 +220,7 @@ const server = createServer({
     // The blob store, not the filesystem. The route hands it a checksum from a row it has already
     // authorised, and the store is the only thing that knows how a checksum becomes a path.
     readBlob: (checksum, format) => blobs.get(checksum, format as Parameters<typeof blobs.get>[1]),
+    listAssetsForKit: (brandKitId, limit) => listAssetsForKit(sql, brandKitId, limit),
   },
   // The port, closing over the pipeline's dependencies. The route never sees the pool.
   generation: { request: (input) => requestGeneration(requestDeps, input) },

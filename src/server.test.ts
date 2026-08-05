@@ -252,6 +252,9 @@ async function withServer(options: Options, fn: (h: Harness) => Promise<void>): 
     async readBlob(checksum, format) {
       return checksum === UPLOAD.checksum && format === UPLOAD.format ? UPLOAD_BYTES : null
     },
+    async listAssetsForKit(brandKitId) {
+      return brandKitId === KIT.id ? [ASSET] : []
+    },
   }
 
   // The generation port. These tests are about the HTTP surface; `generation.test.ts` drives the
