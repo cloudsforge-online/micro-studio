@@ -50,6 +50,8 @@ import { CreditCapError, usd } from './credits.ts'
 import { SpecError, specFor } from './specs.ts'
 import { isBackendChoice, type BackendChoice } from './backend.ts'
 import { provenanceOf, type GenerationJob, type RequestGenerationInput } from './generation.ts'
+import { MAX_UPLOAD_BYTES, UploadRejected } from './imagebytes.ts'
+import { UploadQuotaError, type UploadInput, type UploadOutcome } from './uploads.ts'
 import type { Preflight } from './preflight.ts'
 import type { Asset } from './assets.ts'
 
@@ -62,6 +64,13 @@ export interface PrincipalVerifier {
 export interface ReadModel {
   findJob(id: string): Promise<GenerationJob | null>
   findAsset(id: string): Promise<Asset | null>
+  /** Stored bytes by content address. `null` when this replica does not have them. */
+  readBlob(checksum: string, format: string): Promise<Buffer | null>
+}
+
+/** Accepting an upload, as this file needs it. A port, for the same reason `GenerationRequester` is. */
+export interface UploadReceiver {
+  store(input: UploadInput): Promise<UploadOutcome>
 }
 
 /**
@@ -84,6 +93,7 @@ export interface ServerDeps {
   readonly kits: BrandKitStore
   readonly reads: ReadModel
   readonly generation: GenerationRequester
+  readonly uploads: UploadReceiver
   readonly preflight: Preflight
   readonly beforeScrape?: () => Promise<void>
 }
@@ -117,6 +127,23 @@ export function registerServiceMetrics(metrics: Metrics): Metrics {
       kind: 'counter',
       labels: ['reason'],
     })
+    .register({
+      name: 'studio_uploads_accepted_total',
+      help: 'User image uploads stored',
+      kind: 'counter',
+      labels: ['format', 'deduplicated'],
+    })
+    .register({
+      /**
+       * Refusals, by reason. Labelled rather than logged, because the shape of what is being
+       * refused is the signal: a sudden run of `svg_refused` from one account is somebody probing
+       * for stored XSS, and that is a question a counter can answer and a log line cannot.
+       */
+      name: 'studio_uploads_refused_total',
+      help: 'User image uploads refused, by reason',
+      kind: 'counter',
+      labels: ['reason'],
+    })
 }
 
 /**
@@ -134,6 +161,8 @@ interface Reply {
   readonly status: number
   readonly body?: unknown
   readonly text?: string
+  /** Raw bytes, for serving a stored image. Wins over `text` and `body`. */
+  readonly bytes?: Buffer
   readonly contentType?: string
   readonly headers?: Record<string, string>
 }
@@ -293,6 +322,49 @@ async function handle(route: Route | undefined, ctx: RequestContext, deps: Serve
             // Stated in the response because it is the fact a caller most needs and cannot
             // otherwise know: being refused did not cost them anything.
             imageCallMade: false,
+          },
+        },
+      }
+    }
+    /**
+     * A refused upload is **400 with the reason named**, and the reason is deliberately specific.
+     *
+     * Vagueness here would be security theatre rather than security: the uploader already knows
+     * what they sent, so "SVG is refused because it is a script document" tells an attacker nothing
+     * they did not know and tells the ninety-nine honest users what to do instead. The counter is
+     * incremented on the same label, so the refusal is visible in a dashboard rather than only in
+     * somebody's browser.
+     */
+    if (err instanceof UploadRejected) {
+      deps.metrics.increment('studio_uploads_refused_total', { reason: err.reason })
+      ctx.log.info('upload refused', { reason: err.reason })
+      return {
+        status: 400,
+        body: {
+          error: {
+            code: `upload_${err.reason}`,
+            message: err.message,
+            requestId: ctx.requestId,
+            reason: err.reason,
+          },
+        },
+      }
+    }
+    if (err instanceof UploadQuotaError) {
+      deps.metrics.increment('studio_uploads_refused_total', { reason: 'quota' })
+      ctx.log.info('upload refused by the daily quota', { used: err.used, limit: err.limit })
+      return {
+        status: 429,
+        // Hours, because the window is a rolling day and a second-precision retry-after would be
+        // a number this handler cannot honestly compute without reading the oldest row.
+        headers: { 'retry-after': String(err.windowHours * 3600) },
+        body: {
+          error: {
+            code: 'upload_quota_exceeded',
+            message: err.message,
+            requestId: ctx.requestId,
+            limit: err.limit,
+            used: err.used,
           },
         },
       }
@@ -496,16 +568,183 @@ function buildRoutes(): Route[] {
     define('GET', '/v1/assets/:id', async (ctx, deps) => {
       const principal = await authenticate(ctx, deps)
       if (principal.kind === 'service') requireScope(principal, READ_SCOPE)
-      const asset = await deps.reads.findAsset(idOf(ctx))
-      if (!asset) throw new NotFoundError('no such asset')
-      const job = await deps.reads.findJob(asset.generationJobId)
-      // An asset without its job is the state this whole service exists to make impossible, so it
-      // is a 500 rather than a partial answer: `on delete restrict` should have prevented it.
-      if (!job) throw new Error(`asset ${asset.id} has no generation job`)
-      assertOwned(principal, job.ownerSubject)
-      return { status: 200, body: { asset, provenance: provenanceOf(job) } }
+      const { asset, job } = await readableAsset(ctx, deps, principal)
+      return {
+        status: 200,
+        body: {
+          asset,
+          // An upload has no generation to describe, so the field is absent rather than an object
+          // full of nulls that reads like a generation which failed to record anything.
+          provenance: job ? provenanceOf(job) : null,
+          bytesUrl: `/v1/assets/${asset.id}/bytes`,
+        },
+      }
+    }),
+
+    /**
+     * ══════════════════════════════════════════════════════════════════════════════════════════
+     * **THE BYTES. THIS IS THE ROUTE THAT SERVES ATTACKER-SUPPLIED CONTENT, AND EVERY HEADER ON
+     * IT IS LOAD-BEARING.**
+     *
+     *   * `X-Content-Type-Options: nosniff` — without it a browser may disregard the declared type
+     *     and sniff the body, which is how a file that we labelled `image/png` gets executed as
+     *     something else entirely.
+     *   * `Content-Security-Policy: default-src 'none'; sandbox` — the response can load nothing,
+     *     run nothing and navigate nowhere. Belt and braces against the SVG case, which is already
+     *     refused at upload: if a stored SVG ever did reach this route, the CSP is what stops it
+     *     being a session-stealing document.
+     *   * `Content-Disposition: inline` with no filename — a filename here would be attacker-
+     *     controlled text in a header, and there is nothing it would buy.
+     *   * `Cross-Origin-Resource-Policy: cross-origin` — deliberately permissive, and it has to be:
+     *     these images are embedded by `market-web` and `foresight-web`, which are different
+     *     origins. Without it a browser enforcing COEP refuses to render them.
+     *
+     * The media type is read from the ROW, which was written from the sniffed format, and never
+     * from anything the caller sends. That is the whole chain: bytes decide the type at upload,
+     * the row remembers it, and the response repeats it.
+     *
+     * Immutable caching is safe here and nowhere else in this service, because the URL identifies
+     * an asset whose bytes are content-addressed and therefore cannot change.
+     * ══════════════════════════════════════════════════════════════════════════════════════════
+     */
+    define('GET', '/v1/assets/:id/bytes', async (ctx, deps) => {
+      const principal = await authenticate(ctx, deps)
+      if (principal.kind === 'service') requireScope(principal, READ_SCOPE)
+      const { asset } = await readableAsset(ctx, deps, principal)
+
+      const bytes = await deps.reads.readBlob(asset.checksum, asset.format)
+      if (!bytes) {
+        // The row exists and the blob does not. A 404 rather than a 500: from the caller's side
+        // "we do not have those bytes" is the whole truth, and it is logged at error for us.
+        ctx.log.error('asset row has no blob on this replica', {
+          assetId: asset.id,
+          checksum: asset.checksum,
+        })
+        throw new NotFoundError('the bytes for this asset are not available')
+      }
+
+      return {
+        status: 200,
+        bytes,
+        contentType: asset.mediaType ?? 'application/octet-stream',
+        headers: {
+          'x-content-type-options': 'nosniff',
+          'content-security-policy':
+            "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; sandbox; " +
+            "base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+          'content-disposition': 'inline',
+          'cross-origin-resource-policy': 'cross-origin',
+          'referrer-policy': 'no-referrer',
+          'cache-control': 'private, max-age=31536000, immutable',
+          // The content address, so a client can verify the bytes it received are the bytes the
+          // row claims. Quoted per RFC 7232.
+          etag: `"${asset.checksum}"`,
+        },
+      }
+    }),
+
+    /**
+     * ══════════════════════════════════════════════════════════════════════════════════════════
+     * **THE UPLOAD. AUTHENTICATED, BOUNDED WHILE READING, AND VALIDATED ON CONTENT.**
+     *
+     * The body is raw image bytes rather than `multipart/form-data`. Multipart would mean writing
+     * a parser for a format whose edge cases — nested boundaries, header injection in a part name,
+     * a filename of `../../etc` — are a well-known source of exactly the bugs this endpoint must
+     * not have. A single binary body has no such surface: there is no filename, no part header and
+     * no boundary, so none of them can be malformed. The filename is not lost, because it was never
+     * wanted: the stored name is the content address.
+     *
+     * `Content-Type` is READ but never trusted; it is not consulted at all. `imagebytes.normalise`
+     * decides the format from magic bytes.
+     * ══════════════════════════════════════════════════════════════════════════════════════════
+     */
+    define('POST', '/v1/uploads', async (ctx, deps) => {
+      const principal = await authenticate(ctx, deps)
+      if (principal.kind === 'service') requireScope(principal, WRITE_SCOPE)
+      // An upload is stored against the authenticated user. A service token may act for a named
+      // subject, which is how `market` attributes a listing photo to its seller.
+      const ownerSubject = subjectOf(principal, {
+        userId: ctx.url.searchParams.get('userId') ?? undefined,
+      })
+
+      const bytes = await readBinary(ctx.req)
+
+      const done = deps.lifecycle.track()
+      try {
+        const outcome = await deps.uploads.store({
+          bytes,
+          ownerSubject,
+          actor: actorOf(principal),
+          correlationId: ctx.requestId,
+        })
+        deps.metrics.increment('studio_uploads_accepted_total', {
+          format: outcome.asset.format,
+          deduplicated: String(outcome.deduplicated),
+        })
+        ctx.log.info('upload stored', {
+          assetId: outcome.asset.id,
+          format: outcome.asset.format,
+          deduplicated: outcome.deduplicated,
+          strippedBytes: outcome.strippedBytes,
+        })
+        return {
+          // 200 on a deduplicated retry, 201 on a new asset: the difference is the truth, and a
+          // client that retried after a timeout can tell which of the two happened.
+          status: outcome.deduplicated ? 200 : 201,
+          body: {
+            asset: outcome.asset,
+            bytesUrl: `/v1/assets/${outcome.asset.id}/bytes`,
+            deduplicated: outcome.deduplicated,
+            // Reported so the privacy work is visible rather than merely done. A user uploading a
+            // phone photograph can see that something was removed.
+            metadataStrippedBytes: outcome.strippedBytes,
+          },
+        }
+      } finally {
+        done()
+      }
     }),
   ]
+}
+
+/**
+ * An asset the principal may read, and the job behind it if there is one.
+ *
+ * The ownership rule differs by origin and both branches are here so they cannot drift:
+ *
+ *   * **generated** — ownership lives on the generation job, which is where it has always lived.
+ *   * **upload** — ownership is `owner_subject` on the asset itself; there is no job.
+ *
+ * `assets.owner_subject` is populated for both by migration 9, but a generated row written by the
+ * previous release may still have it null during a rolling deploy, so the job remains the
+ * authority for generated assets rather than the new column. That is the expand half of
+ * expand/contract behaving exactly as intended.
+ */
+async function readableAsset(
+  ctx: RequestContext,
+  deps: ServerDeps,
+  principal: Principal,
+): Promise<{ asset: Asset; job: GenerationJob | null }> {
+  const asset = await deps.reads.findAsset(idOf(ctx))
+  if (!asset) throw new NotFoundError('no such asset')
+
+  if (asset.generationJobId) {
+    const job = await deps.reads.findJob(asset.generationJobId)
+    // An asset without its job is the state this whole service exists to make impossible, so it
+    // is a 500 rather than a partial answer: `on delete restrict` should have prevented it.
+    if (!job) throw new Error(`asset ${asset.id} has no generation job`)
+    assertOwned(principal, job.ownerSubject)
+    return { asset, job }
+  }
+
+  if (!asset.ownerSubject) {
+    // Unreachable while `assets_origin_consistent` holds, which is the point of asserting it: an
+    // asset with neither a job nor an owner has no ownership rule, and the safe answer to "may
+    // this principal read it" when there is no rule is never "yes".
+    throw new Error(`asset ${asset.id} has neither a generation job nor an owner`)
+  }
+  assertOwned(principal, asset.ownerSubject)
+  return { asset, job: null }
 }
 
 /* ------------------------------------------------------------------------ helpers */
@@ -629,6 +868,37 @@ function readTypography(value: unknown): Record<string, string> {
   return out
 }
 
+/**
+ * Read a raw binary body, refusing at the byte that crosses the cap.
+ *
+ * The check is inside the loop and BEFORE the chunk is retained, exactly as `readJson` does it. A
+ * size check performed after buffering — `if (body.length > MAX)` on a fully-read body — is not a
+ * limit, it is a report: by the time it fires the process has already allocated whatever an
+ * unauthenticated caller decided to send. This endpoint is authenticated, which lowers the exposure
+ * and does not change the reasoning, because a single compromised token should not be able to
+ * exhaust a replica's memory.
+ *
+ * `UploadRejected` rather than `BadRequestError` so it lands on the same mapped 400 with a reason
+ * code as every other refusal, and shows up under the same counter.
+ */
+async function readBinary(req: IncomingMessage): Promise<Buffer> {
+  const chunks: Buffer[] = []
+  let size = 0
+  for await (const chunk of req) {
+    const buffer = chunk as Buffer
+    size += buffer.length
+    if (size > MAX_UPLOAD_BYTES) {
+      throw new UploadRejected(
+        'too_large',
+        `an upload may be at most ${MAX_UPLOAD_BYTES} bytes, and this request exceeded that while ` +
+          'still being read',
+      )
+    }
+    chunks.push(buffer)
+  }
+  return Buffer.concat(chunks)
+}
+
 async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
   const chunks: Buffer[] = []
   let size = 0
@@ -665,15 +935,25 @@ function errorReply(status: number, code: string, message: string, requestId: st
 
 function send(res: ServerResponse, reply: Reply, requestId: string): void {
   if (res.writableEnded) return
-  const payload = reply.text ?? `${JSON.stringify(reply.body ?? {})}\n`
+  const payload =
+    reply.bytes ?? Buffer.from(reply.text ?? `${JSON.stringify(reply.body ?? {})}\n`, 'utf8')
   res.writeHead(reply.status, {
-    ...(reply.headers ?? {}),
-    'content-type': reply.contentType ?? 'application/json; charset=utf-8',
-    'content-length': Buffer.byteLength(payload),
-    'x-request-id': requestId,
     // Health, metrics and job status are a point-in-time fact. A cached 200 from a replica that
     // has since gone unready is exactly the lie this arrangement exists to stop telling.
+    //
+    // It is the DEFAULT rather than the last word, because stored image bytes are the one thing
+    // this service serves that is genuinely immutable — the URL contains a content address, so the
+    // bytes behind it cannot change. `no-store` there would re-fetch every image on every page
+    // view for no correctness gain at all. A route that wants to say otherwise sets the header and
+    // its value survives the spread below.
     'cache-control': 'no-store',
+    ...(reply.headers ?? {}),
+    // These three are authoritative and are placed after the spread so a route cannot get them
+    // wrong: a mismatched content-length truncates the response, and an unechoed request id breaks
+    // every support conversation.
+    'content-type': reply.contentType ?? 'application/json; charset=utf-8',
+    'content-length': payload.length,
+    'x-request-id': requestId,
   })
   res.end(payload)
 }

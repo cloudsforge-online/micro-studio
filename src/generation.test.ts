@@ -39,13 +39,18 @@ const never = AbortSignal.timeout(30_000)
 /** An in-memory blob store, so a test does not scatter files across the working tree. */
 function memoryBlobs(): AssetBlobStore & { written: Buffer[] } {
   const written: Buffer[] = []
+  const byPath = new Map<string, Buffer>()
   return {
     written,
     async put(bytes, format) {
       written.push(bytes)
       const { createHash } = await import('node:crypto')
       const checksum = `sha256:${createHash('sha256').update(bytes).digest('hex')}`
+      byPath.set(`${checksum}.${format}`, bytes)
       return { storageUrl: `memory://${checksum}.${format}`, checksum, byteSize: bytes.length }
+    },
+    async get(checksum, format) {
+      return byPath.get(`${checksum}.${format}`) ?? null
     },
   }
 }

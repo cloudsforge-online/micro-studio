@@ -16,7 +16,10 @@ import {
   registerServiceMetrics,
   type GenerationRequester,
   type ReadModel,
+  type UploadReceiver,
 } from './server.ts'
+import { UploadRejected } from './imagebytes.ts'
+import { UploadQuotaError, type UploadInput } from './uploads.ts'
 import { assetRootProbe, checkAssetRoot } from './assets.ts'
 import { BrandKitConflictError, type BrandKit, type BrandKitStore, type CreateBrandKit } from './brandkits.ts'
 import { CreditCapError } from './credits.ts'
@@ -97,10 +100,13 @@ const JOB: GenerationJob = {
 
 const ASSET: Asset = {
   id: 'asset-1',
+  origin: 'generated',
   brandKitId: KIT.id,
   generationJobId: JOB.id,
+  ownerSubject: JOB.ownerSubject,
   kind: 'mark',
   format: 'png',
+  mediaType: 'image/png',
   declaredWidth: 1024,
   declaredHeight: 1024,
   actualWidth: 1024,
@@ -111,8 +117,40 @@ const ASSET: Asset = {
   byteSize: 629_074,
   licence: 'cloudsforge-generated: commercial use permitted; AI-generated, C2PA provenance retained',
   c2pa: true,
+  // Unanchored, because nothing can anchor it: Hearth has no Registry of Authorship contract.
+  anchor: { state: 'unanchored', transactionHash: null, blockNumber: null, anchoredAt: null },
   createdAt: '1970-01-01T00:00:01.000Z',
 }
+
+/**
+ * An uploaded asset owned by the same subject. No brand kit, no generation job — the shape
+ * `assets_origin_consistent` permits for `origin='upload'`.
+ */
+const UPLOAD: Asset = {
+  id: 'asset-upload-1',
+  origin: 'upload',
+  brandKitId: null,
+  generationJobId: null,
+  ownerSubject: JOB.ownerSubject,
+  kind: 'upload',
+  format: 'jpeg',
+  mediaType: 'image/jpeg',
+  declaredWidth: 64,
+  declaredHeight: 48,
+  actualWidth: 64,
+  actualHeight: 48,
+  sizing: 'exact',
+  storageUrl: 'memory://sha256:def.jpeg',
+  checksum: 'sha256:def',
+  byteSize: 1_024,
+  licence: 'cloudsforge-uploaded: supplied by the uploader',
+  c2pa: false,
+  anchor: { state: 'unanchored', transactionHash: null, blockNumber: null, anchoredAt: null },
+  createdAt: '1970-01-01T00:00:02.000Z',
+}
+
+/** The stored bytes the `/bytes` route serves in these tests. */
+const UPLOAD_BYTES = Buffer.from('not-a-real-jpeg-but-the-route-does-not-decode')
 
 function memoryKits(): BrandKitStore & { rows: BrandKit[] } {
   const rows: BrandKit[] = []
@@ -160,6 +198,8 @@ interface Options {
   readonly preflight?: Preflight
   /** Injected into the generation port, to drive the refusal mappings. */
   readonly refuseWith?: Error
+  /** Injected into the upload port, to drive the upload refusal mappings. */
+  readonly uploadRefuseWith?: Error
 }
 
 interface Harness {
@@ -168,6 +208,8 @@ interface Harness {
   readonly metrics: Metrics
   readonly kits: BrandKitStore & { rows: BrandKit[] }
   readonly accepted: RequestGenerationInput[]
+  /** Every upload the port received, so a test can assert what reached the pipeline. */
+  readonly uploaded: UploadInput[]
 }
 
 async function withServer(options: Options, fn: (h: Harness) => Promise<void>): Promise<void> {
@@ -186,7 +228,12 @@ async function withServer(options: Options, fn: (h: Harness) => Promise<void>): 
       return id === JOB.id ? JOB : null
     },
     async findAsset(id) {
-      return id === ASSET.id ? ASSET : null
+      if (id === ASSET.id) return ASSET
+      if (id === UPLOAD.id) return UPLOAD
+      return null
+    },
+    async readBlob(checksum, format) {
+      return checksum === UPLOAD.checksum && format === UPLOAD.format ? UPLOAD_BYTES : null
     },
   }
 
@@ -212,6 +259,20 @@ async function withServer(options: Options, fn: (h: Harness) => Promise<void>): 
     },
   }
 
+  /**
+   * The upload port. Deliberately does NOT re-run `normalise` — the validator has its own
+   * exhaustive suite in `imagebytes.test.ts`, and the seam these tests exercise is the HTTP one:
+   * status codes, headers, auth and the mapping of a refusal onto a response.
+   */
+  const uploaded: UploadInput[] = []
+  const uploads: UploadReceiver = {
+    async store(input) {
+      if (options.uploadRefuseWith) throw options.uploadRefuseWith
+      uploaded.push(input)
+      return { asset: UPLOAD, deduplicated: false, strippedBytes: 12 }
+    },
+  }
+
   const server: Server = createServer({
     lifecycle,
     logger,
@@ -220,6 +281,7 @@ async function withServer(options: Options, fn: (h: Harness) => Promise<void>): 
     kits,
     reads,
     generation,
+    uploads,
     preflight: options.preflight ?? new Preflight(fluxConfigFor('https://test01eastus01.services.ai.azure.com')),
   })
 
@@ -227,7 +289,7 @@ async function withServer(options: Options, fn: (h: Harness) => Promise<void>): 
   if (options.ready !== false) lifecycle.markReady()
   const { port } = server.address() as AddressInfo
   try {
-    await fn({ url: `http://127.0.0.1:${port}`, lifecycle, metrics, kits, accepted })
+    await fn({ url: `http://127.0.0.1:${port}`, lifecycle, metrics, kits, accepted, uploaded })
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()))
   }
@@ -790,6 +852,156 @@ test('an unknown job or asset is 404', async () => {
     const headers = { authorization: `Bearer ${token}` }
     assert.equal((await fetch(`${h.url}/v1/jobs/nope`, { headers })).status, 404)
     assert.equal((await fetch(`${h.url}/v1/assets/nope`, { headers })).status, 404)
+  })
+})
+
+/* --------------------------------------------------------------- uploads */
+
+test('POST /v1/uploads with no token is 401, before any byte is read', async () => {
+  await withServer({}, async (h) => {
+    const res = await fetch(`${h.url}/v1/uploads`, { method: 'POST', body: Buffer.from('x') })
+    assert.equal(res.status, 401)
+    assert.equal(h.uploaded.length, 0, 'an unauthenticated body reached the pipeline')
+  })
+})
+
+test('POST /v1/uploads stores the bytes and answers with the asset and its bytes URL', async () => {
+  const token = await sign({ sub: USER, handle: 'ash', roles: ['player'] })
+  await withServer({}, async (h) => {
+    const res = await fetch(`${h.url}/v1/uploads`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/octet-stream' },
+      body: Buffer.from('the-bytes'),
+    })
+    assert.equal(res.status, 201)
+    const body = (await res.json()) as { asset: Asset; bytesUrl: string; deduplicated: boolean }
+    assert.equal(body.asset.origin, 'upload')
+    assert.equal(body.bytesUrl, `/v1/assets/${UPLOAD.id}/bytes`)
+    assert.equal(body.deduplicated, false)
+
+    // The bytes reached the pipeline intact, and were attributed to the authenticated subject.
+    assert.equal(h.uploaded.length, 1)
+    assert.deepEqual(h.uploaded[0]?.bytes, Buffer.from('the-bytes'))
+    assert.equal(h.uploaded[0]?.ownerSubject, SUBJECT)
+  })
+})
+
+/**
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * THE REFUSAL MAPPINGS. `imagebytes.test.ts` proves the validator refuses; these prove the refusal
+ * becomes the right STATUS with the reason a client can branch on — the half that would otherwise
+ * be a 500 in front of a user.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+test('a refused upload is 400 carrying the reason, not a 500', async () => {
+  const token = await sign({ sub: USER, handle: 'ash', roles: ['player'] })
+  const refusal = new UploadRejected('svg_refused', 'SVG and XML uploads are refused')
+  await withServer({ uploadRefuseWith: refusal }, async (h) => {
+    const res = await fetch(`${h.url}/v1/uploads`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}` },
+      body: Buffer.from('<svg/>'),
+    })
+    assert.equal(res.status, 400)
+    const body = (await res.json()) as { error: { code: string; reason: string } }
+    assert.equal(body.error.code, 'upload_svg_refused')
+    assert.equal(body.error.reason, 'svg_refused')
+    // And the refusal is counted under its own label, so a run of probes is visible on a dashboard.
+    assert.match(h.metrics.render(), /studio_uploads_refused_total\{reason="svg_refused"\} 1/)
+  })
+})
+
+test('an over-quota upload is 429 with a Retry-After, not 402 and not 403', async () => {
+  const token = await sign({ sub: USER, handle: 'ash', roles: ['player'] })
+  await withServer({ uploadRefuseWith: new UploadQuotaError('uploads', 200, 200, 24) }, async (h) => {
+    const res = await fetch(`${h.url}/v1/uploads`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}` },
+      body: Buffer.from('x'),
+    })
+    assert.equal(res.status, 429)
+    assert.equal(res.headers.get('retry-after'), String(24 * 3600))
+    const body = (await res.json()) as { error: { code: string } }
+    assert.equal(body.error.code, 'upload_quota_exceeded')
+  })
+})
+
+/* --------------------------------------------------------------- serving bytes */
+
+test('GET /v1/assets/:id/bytes serves the stored bytes under the hardened headers', async () => {
+  const token = await sign({ sub: USER, handle: 'ash', roles: ['player'] })
+  await withServer({}, async (h) => {
+    const res = await fetch(`${h.url}/v1/assets/${UPLOAD.id}/bytes`, {
+      headers: { authorization: `Bearer ${token}` },
+    })
+    assert.equal(res.status, 200)
+    assert.deepEqual(Buffer.from(await res.arrayBuffer()), UPLOAD_BYTES)
+
+    // The type comes from the ROW, which was written from the sniffed bytes — never from a header
+    // the uploader sent.
+    assert.equal(res.headers.get('content-type'), 'image/jpeg')
+
+    // Each of these is what stops a stored file becoming a script on this origin.
+    assert.equal(res.headers.get('x-content-type-options'), 'nosniff')
+    const csp = res.headers.get('content-security-policy') ?? ''
+    assert.match(csp, /default-src 'none'/)
+    assert.match(csp, /sandbox/)
+    assert.match(csp, /frame-ancestors 'none'/)
+    assert.equal(res.headers.get('content-disposition'), 'inline')
+    assert.equal(res.headers.get('cross-origin-resource-policy'), 'cross-origin')
+
+    // Content-addressed, so it is safe to cache hard — and the ETag is the address itself.
+    assert.match(res.headers.get('cache-control') ?? '', /immutable/)
+    assert.equal(res.headers.get('etag'), `"${UPLOAD.checksum}"`)
+  })
+})
+
+test('the bytes route is 404 when the row exists but the blob does not', async () => {
+  const token = await sign({ sub: USER, handle: 'ash', roles: ['player'] })
+  await withServer({}, async (h) => {
+    // ASSET's checksum has no blob in the harness store. A dangling reference is a 404 to the
+    // caller rather than a 500, because "we do not have those bytes" is the whole truth.
+    const res = await fetch(`${h.url}/v1/assets/${ASSET.id}/bytes`, {
+      headers: { authorization: `Bearer ${token}` },
+    })
+    assert.equal(res.status, 404)
+  })
+})
+
+test("another user's uploaded asset is 404, both as metadata and as bytes", async () => {
+  // 404 rather than 403 on purpose: a distinct 403 for "exists but is not yours" is an enumeration
+  // oracle over every asset id in the estate.
+  const stranger = await sign({
+    sub: '22222222-2222-4222-8222-222222222222',
+    handle: 'rook',
+    roles: ['player'],
+  })
+  await withServer({}, async (h) => {
+    const headers = { authorization: `Bearer ${stranger}` }
+    assert.equal((await fetch(`${h.url}/v1/assets/${UPLOAD.id}`, { headers })).status, 404)
+    assert.equal((await fetch(`${h.url}/v1/assets/${UPLOAD.id}/bytes`, { headers })).status, 404)
+  })
+})
+
+test('an uploaded asset reports no provenance and an unanchored state', async () => {
+  const token = await sign({ sub: USER, handle: 'ash', roles: ['player'] })
+  await withServer({}, async (h) => {
+    const res = await fetch(`${h.url}/v1/assets/${UPLOAD.id}`, {
+      headers: { authorization: `Bearer ${token}` },
+    })
+    assert.equal(res.status, 200)
+    const body = (await res.json()) as { asset: Asset; provenance: unknown }
+    // Null rather than an object of nulls: an upload has no generation to describe, and a shape
+    // full of empty provenance fields reads like a generation that failed to record anything.
+    assert.equal(body.provenance, null)
+    // ══════════════════════════════════════════════════════════════════════════════════════════
+    // THE HONESTY ASSERTION. Nothing may report an asset as anchored or verified while Hearth has
+    // no Registry of Authorship contract to anchor it to. This is the test that fails if somebody
+    // later populates the anchor columns with something plausible.
+    // ══════════════════════════════════════════════════════════════════════════════════════════
+    assert.equal(body.asset.anchor.state, 'unanchored')
+    assert.equal(body.asset.anchor.transactionHash, null)
+    assert.equal(body.asset.anchor.blockNumber, null)
   })
 })
 

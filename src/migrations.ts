@@ -334,6 +334,128 @@ export const MIGRATIONS: readonly Migration[] = [
         );
     `,
   },
+  {
+    version: 9,
+    name: 'uploaded_assets',
+    /**
+     * User uploads, in the SAME table as generated assets — and the reasons are worth stating
+     * because a separate `uploads` table was the obvious alternative and is worse in three ways.
+     *
+     * One table means **one id space**, so `foresight` and `market` store one kind of reference and
+     * a consumer never has to know which table to look in to resolve it. It means **one serving
+     * route**, so the `nosniff`/CSP headers and the ownership check are written once rather than
+     * twice with a drift between them. And it means **one ACL**, which is the half that actually
+     * bites: two tables is two places to get "may this principal see these bytes" right, and the
+     * second one is always the one that is forgotten.
+     *
+     * ══════════════════════════════════════════════════════════════════════════════════════════
+     * **PROVENANCE IS NOT WEAKENED, IT IS MADE CONDITIONAL AND STILL ENFORCED.**
+     *
+     * `generation_job_id` becomes nullable, which reads like the retreat that version 7's header
+     * warns against — `restrict` exists so the record of what produced an asset cannot be deleted
+     * out from under it. It is not a retreat, because `assets_origin_consistent` below makes the
+     * requirement absolute in the case where it means anything: an asset with `origin='generated'`
+     * MUST still have a job, and the `on delete restrict` on that column is untouched. An upload
+     * has no generation to have provenance OF; forcing a synthetic job row for one would have
+     * manufactured a prompt, a model and a cost that never existed, which is the opposite of what
+     * that constraint protects.
+     * ══════════════════════════════════════════════════════════════════════════════════════════
+     *
+     * The anchor columns and the checksum shape are copied from `tessera/src/migrations.ts:603-633`
+     * deliberately, down to the spelling: one estate vocabulary rather than two dialects. See the
+     * note on `assets_anchor_is_whole`.
+     */
+    up: `
+      alter table assets add column if not exists origin text not null default 'generated';
+      alter table assets add column if not exists owner_subject text;
+      alter table assets add column if not exists media_type text;
+
+      -- Anchoring, from tessera. NULLABLE AND UNPOPULATED ON PURPOSE — see the constraint below.
+      alter table assets add column if not exists anchor_tx text;
+      alter table assets add column if not exists anchor_block bigint;
+      alter table assets add column if not exists anchored_at timestamptz;
+
+      -- An upload has no brand kit and no generation job. Both drop their NOT NULL; the pairing
+      -- constraint below is what keeps that from meaning "anything goes".
+      alter table assets alter column generation_job_id drop not null;
+      alter table assets alter column brand_kit_id drop not null;
+
+      -- Backfill the owner onto every asset that already exists, from the job that produced it.
+      -- This is the EXPAND half: the column stays nullable for now so a replica of the previous
+      -- release, which does not know to write it, keeps working through the rolling deploy. A
+      -- later migration makes it NOT NULL once no such replica can exist. Four releases, per the
+      -- file header — this is release one.
+      update assets a
+         set owner_subject = j.owner_subject
+        from generation_jobs j
+       where j.id = a.generation_job_id
+         and a.owner_subject is null;
+
+      alter table assets drop constraint if exists assets_origin_known;
+      alter table assets add constraint assets_origin_known
+        check (origin in ('generated', 'upload'));
+
+      -- The pairing. A generated asset has a kit and a job; an uploaded one has neither and has an
+      -- owner instead. Anything else is a row nobody can interpret, so it cannot be written.
+      alter table assets drop constraint if exists assets_origin_consistent;
+      alter table assets add constraint assets_origin_consistent check (
+        (origin = 'generated' and generation_job_id is not null and brand_kit_id is not null)
+        or
+        (origin = 'upload' and generation_job_id is null and brand_kit_id is null
+         and owner_subject is not null and media_type is not null)
+      );
+
+      -- studio's own spelling, and tessera's: 'sha256:' + 64 lowercase hex. Held in the schema so
+      -- a checksum copied from a studio response is the value this column stores, with no
+      -- reformatting step on any path that could drop the prefix on one and not the other.
+      alter table assets drop constraint if exists assets_checksum_shape;
+      alter table assets add constraint assets_checksum_shape
+        check (checksum ~ '^sha256:[0-9a-f]{64}$');
+
+      -- ════════════════════════════════════════════════════════════════════════════════════════
+      -- DEDUPLICATION IS PER OWNER, AND IT IS A PARTIAL INDEX. BOTH HALVES ARE LOAD-BEARING.
+      --
+      -- where origin = 'upload' is not an optimisation. A unique index across ALL assets would
+      -- break generation outright: placeholder.ts is deterministic by design and tested for it, so
+      -- two jobs for the same kit and spec produce BYTE-IDENTICAL svg, and the second insert would
+      -- be refused by a constraint the caller cannot do anything about.
+      --
+      -- (owner_subject, checksum) rather than (checksum) is the cross-tenant half. Globally
+      -- unique would mean the second person to upload a common image silently receives a row owned
+      -- by the first — which discloses that the first person uploaded it, and hands out a reference
+      -- to somebody else's asset. Per owner, a retry by the same uploader collapses to one row
+      -- (idempotent, which is what a retried upload should be) while two owners each get their own.
+      -- The BYTES are still stored once regardless, because the blob path is the content address.
+      -- ════════════════════════════════════════════════════════════════════════════════════════
+      create unique index if not exists assets_upload_is_its_bytes
+        on assets (owner_subject, checksum) where origin = 'upload';
+
+      -- ════════════════════════════════════════════════════════════════════════════════════════
+      -- THE ANCHOR IS WHOLE OR IT IS ABSENT. IT IS ABSENT, AND THAT IS THE HONEST STATE.
+      --
+      -- Copied from objects_anchor_is_whole (tessera/src/migrations.ts:628). Half an anchor — a
+      -- block with no transaction, a timestamp with no block — is a claim the chain does not back,
+      -- and it is exactly the shape a verification that always passes would take.
+      --
+      -- Nothing populates these columns today and nothing in this release will. Hearth has no
+      -- Registry of Authorship contract: tessera/src/kiln.ts:373-392 records that the Solidity
+      -- has never been written and that mint's catalogue deploys a closed set of three ERC-20
+      -- variants, so there is no path to deploy one. Writing a plausible-looking anchor_tx here
+      -- would produce an asset that reports itself verified against a chain that has never heard
+      -- of it. The columns exist so the anchor can be added without a second migration; they stay
+      -- null until a contract exists, and every read path reports 'unanchored' rather than
+      -- inventing a status.
+      -- ════════════════════════════════════════════════════════════════════════════════════════
+      alter table assets drop constraint if exists assets_anchor_is_whole;
+      alter table assets add constraint assets_anchor_is_whole check (
+        (anchor_tx is null and anchor_block is null and anchored_at is null)
+        or (anchor_tx is not null and anchor_block is not null and anchored_at is not null)
+      );
+
+      create index if not exists assets_owner_idx
+        on assets (owner_subject, created_at desc) where owner_subject is not null;
+    `,
+  },
 ]
 
 /**

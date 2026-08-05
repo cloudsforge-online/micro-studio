@@ -336,6 +336,7 @@ export async function runGeneration(
       const asset = await insertAsset(tx, {
         brandKitId: job.brandKitId,
         generationJobId: job.id,
+        ownerSubject: job.ownerSubject,
         kind: job.spec.kind,
         format: result.format,
         declaredWidth: job.spec.width,

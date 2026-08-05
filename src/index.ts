@@ -39,6 +39,7 @@ import {
   findAsset,
 } from './assets.ts'
 import { findJob, requestGeneration, GENERATE_KIND } from './generation.ts'
+import { DEFAULT_UPLOAD_QUOTA, storeUpload } from './uploads.ts'
 import { fluxBackend, placeholderBackend, type BackendSet } from './backend.ts'
 import { Preflight, imageBackendProbe } from './preflight.ts'
 
@@ -215,9 +216,16 @@ const server = createServer({
   reads: {
     findJob: (id) => findJob(sql, id),
     findAsset: (id) => findAsset(sql, id),
+    // The blob store, not the filesystem. The route hands it a checksum from a row it has already
+    // authorised, and the store is the only thing that knows how a checksum becomes a path.
+    readBlob: (checksum, format) => blobs.get(checksum, format as Parameters<typeof blobs.get>[1]),
   },
   // The port, closing over the pipeline's dependencies. The route never sees the pool.
   generation: { request: (input) => requestGeneration(requestDeps, input) },
+  uploads: {
+    store: (input) =>
+      storeUpload({ sql, producer: SERVICE, blobs, quota: DEFAULT_UPLOAD_QUOTA }, input),
+  },
   preflight,
   // Queue depth is sampled at scrape time rather than on a timer. There is no `setInterval` in
   // this repository, and CI greps for one — rule 8.
