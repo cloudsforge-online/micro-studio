@@ -4,7 +4,7 @@
  * ## What this replaces
  *
  * `asset-forge`'s control is `SPEND_LIMIT_USD` (default `$2`) plus a TTY prompt
- * (`generate.ts:55, 186-194, 280-293`). Three things are wrong with it as a service control:
+ * (`generate.ts, 186-194, 280-293`). Three things are wrong with it as a service control:
  *
  *   1. It is **per run**, not per account. Ten runs of $1.90 spend $19 and never prompt.
  *   2. It is enforced by a **terminal**. `confirm()` returns false off a TTY, so the only

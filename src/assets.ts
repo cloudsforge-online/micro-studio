@@ -82,7 +82,7 @@ export const UPLOADED_LICENCE =
  * ══════════════════════════════════════════════════════════════════════════════════════════════
  * **`unanchored` IS THE ONLY VALUE THIS SERVICE CAN PRODUCE TODAY, AND SAYING SO IS THE POINT.**
  *
- * There is no Registry of Authorship contract on Hearth — `tessera/src/kiln.ts:373-392` records
+ * There is no Registry of Authorship contract on Hearth — `tessera/src/kiln.ts` records
  * that the Solidity has never been written and that `mint` can only deploy a closed set of three
  * ERC-20 variants, so there is no path to deploy one. An asset therefore has a content address
  * that is recorded and NOT a chain anchor that is verified, and those are different claims.

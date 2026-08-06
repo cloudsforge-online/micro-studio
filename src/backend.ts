@@ -73,7 +73,7 @@
  * reason, so retrying it cannot succeed — it can only spend the fallback's quota and turn one
  * clear refusal into two, with a misleading "trying fallback model" line in between.
  * `asset-forge` removed its own gpt-image-2 → gpt-image-1 chain over precisely this
- * (`model.ts:14-18`: "every asset paid for a failed request and printed a warning that read like a
+ * (`model.ts`: "every asset paid for a failed request and printed a warning that read like a
  * real fault before the fallback quietly succeeded").
  *
  * 401 and 403 do not fall back either, for a different reason: authentication is a property of the

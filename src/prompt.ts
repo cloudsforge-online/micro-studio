@@ -75,7 +75,7 @@ export function brandStyle(accent: string): string {
  *   * **three-quarter isometric from above-left, 2:1 dimetric** — the projection is the world's,
  *     not the maker's. It is what makes one player's chair sit in the same room as another's.
  *   * **standing alone on a flat #12100f ground** — diffusion emits no alpha, so transparency is a
- *     derive step keyed against a KNOWN colour (`brand/normalise_ground.py:27`). A generation on
+ *     derive step keyed against a KNOWN colour (`brand/normalise_ground.py`). A generation on
  *     any other ground cannot be cut out.
  *   * **one canonical facing** — the second is a horizontal mirror at render time, because this
  *     service has no `seed` column and a pipeline that cannot fix a seed cannot render the same

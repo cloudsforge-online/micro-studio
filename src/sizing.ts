@@ -1,7 +1,7 @@
 /**
  * Sizing, in pure TypeScript, so the pipeline runs in CI.
  *
- * `asset-forge` shells out to macOS `sips` (`resize.ts:19-25`), which means the whole
+ * `asset-forge` shells out to macOS `sips` (`resize.ts`), which means the whole
  * post-processing stage exists only on one laptop: off macOS it degrades to a warning and every
  * asset ships at whatever the model returned. design-system.md §7 item 3 names the cost —
  * "twelve game masters currently sit at 1024² against declared 512²/256² because the refit has

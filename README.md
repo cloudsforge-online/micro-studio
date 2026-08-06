@@ -128,7 +128,7 @@ than a hardcoded pair so that adopting a second model is an environment change, 
 **The chain falls back on 404, 429, 5xx and transport faults. Never on 400.** A prompt the safety
 filter refused fails identically on the fallback model, so retrying spends the fallback's quota to
 produce the same refusal — `asset-forge` deleted its own fallback chain over exactly this
-(`model.ts:14-18`). 401 and 403 do not fall back either: authentication is a property of the
+(`model.ts`). 401 and 403 do not fall back either: authentication is a property of the
 resource, not of the model.
 
 ### Costs
