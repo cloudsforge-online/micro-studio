@@ -208,6 +208,14 @@ export interface SetVisibilityInput {
  * this service. A publication that is visible in the database but was never announced is a
  * consumer — a cache, a moderation queue, a CDN purge — working from a state that no longer
  * exists, and this is the one state change where that gap has a privacy consequence.
+ *
+ * The topic is `studio.asset.visibility_changed`, one underscore and not two dots. It was
+ * `studio.asset.visibility.changed` — four segments — and `TOPIC_PATTERN` in
+ * `@cloudsforge/contracts-events` admits exactly three, so the name could not be registered and no
+ * envelope carrying it could validate. The announcement this docstring calls load-bearing was
+ * therefore unconsumable by anything that checks its envelopes, which is every consumer in the
+ * estate. Renamed with no coordination cost: `estate-topics` found no consumer anywhere, because
+ * there could not be one. micro-org#263.
  */
 export async function changeVisibility(
   deps: Pick<UploadDeps, 'sql' | 'producer'>,
@@ -217,7 +225,7 @@ export async function changeVisibility(
     const asset = await setAssetVisibility(tx, input.assetId, input.visibility, input.actor)
     if (!asset) return null
     emit({
-      topic: 'studio.asset.visibility.changed',
+      topic: 'studio.asset.visibility_changed',
       key: asset.id,
       payload: {
         id: asset.id,
