@@ -1,6 +1,6 @@
 {
   "name": "@cloudsforge/studio",
-  "version": "2.5.19",
+  "version": "2.5.20",
   "private": true,
   "description": "Asset generation. Brand kits, asset specs, leased generation jobs and provenance-complete assets, generated through a reported image-backend chain with a per-account spend cap enforced before the call.",
   "license": "MIT",
@@ -38,6 +38,7 @@
   ],
   "dependencies": {
     "@cloudsforge/auth": "link:../runtime/packages/auth",
+    "@cloudsforge/contracts-events": "link:../contracts/packages/events",
     "@cloudsforge/db": "link:../runtime/packages/db",
     "@cloudsforge/http": "link:../runtime/packages/http",
     "@cloudsforge/jobs": "link:../runtime/packages/jobs",

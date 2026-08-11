@@ -1,15 +1,25 @@
 # syntax=docker/dockerfile:1.7
 #
-# Build context is this repository, plus one named context for the unpublished sibling packages:
+# Build context is this repository, plus two named contexts for the unpublished sibling packages:
 #
-#   docker build -t studio --build-context runtimepkgs=../runtime .
+#   docker build -t studio \
+#     --build-context runtimepkgs=../runtime \
+#     --build-context contractspkgs=../contracts .
 #
-# The extra context is temporary. Once the @cloudsforge/* packages are published (AD-02),
-# package.json takes registry versions, the COPY lines marked below are deleted, the flag goes
+# Both extra contexts are temporary. Once the @cloudsforge/* packages are published (AD-02),
+# package.json takes registry versions, the COPY lines marked below are deleted, the flags go
 # away, and this becomes an ordinary single-context build. Nothing else changes.
 #
-# It is named `runtimepkgs` rather than `runtime` because a build context and a build stage share
-# one namespace, and the final stage below is called `runtime`.
+# They are named `runtimepkgs`/`contractspkgs` rather than `runtime`/`contracts` because a build
+# context and a build stage share one namespace, and the final stage below is called `runtime`.
+#
+# `contractspkgs` arrives with this change and every other service already had it. The shared
+# workflow has always passed BOTH contexts (micro-org `service-ci.yml`), so the omission cost
+# nothing until the day this repository first imported a contracts package — measured 2026-08-11,
+# that day, as `TS2307: Cannot find module '@cloudsforge/contracts-events'` from `pnpm typecheck`
+# inside the image, on a branch whose repository-level typecheck was green. That gap is the whole
+# reason the line is worth a comment: the image build typechecks against a DIFFERENT tree than the
+# workspace does, and only the image build was ever going to notice.
 
 # ----------------------------------------------------------------------------------- deps
 FROM node:22-slim AS deps
@@ -20,18 +30,22 @@ FROM node:22-slim AS deps
 RUN corepack enable && corepack prepare pnpm@11.9.0 --activate
 WORKDIR /app
 
-# Temporary: the link: dependencies resolve to ../runtime relative to this directory, so the
-# packages must exist at that path inside the image for the lockfile to stay frozen.
+# Temporary: the link: dependencies resolve to ../runtime and ../contracts relative to this
+# directory, so the packages must exist at those paths inside the image for the lockfile to stay
+# frozen.
 COPY --from=runtimepkgs package.json pnpm-workspace.yaml pnpm-lock.yaml /runtime/
 COPY --from=runtimepkgs packages /runtime/packages
+COPY --from=contractspkgs package.json pnpm-workspace.yaml pnpm-lock.yaml /contracts/
+COPY --from=contractspkgs packages /contracts/packages
 
-# Install the runtime workspace's OWN dependencies first. `link:` uses the sibling as-is and
-# does not manage its dependency tree, so /runtime's node_modules must exist independently —
-# both for `tsc` to resolve the runtime source it typechecks (jose, @opentelemetry/api) and
+# Install the siblings' OWN dependencies first. `link:` uses the sibling as-is and does not
+# manage its dependency tree, so /runtime's and /contracts' node_modules must exist independently —
+# both for `tsc` to resolve the sibling source it typechecks (jose, @opentelemetry/api) and
 # for `node --import tsx` to load @cloudsforge/* at run time. Without this the image builds a
 # set of @cloudsforge symlinks that point at source which cannot resolve its own imports.
 RUN --mount=type=cache,id=pnpm-store,target=/pnpm-store,sharing=locked \
-    pnpm --dir /runtime install --frozen-lockfile --config.store-dir=/pnpm-store
+    pnpm --dir /runtime install --frozen-lockfile --config.store-dir=/pnpm-store \
+ && pnpm --dir /contracts install --frozen-lockfile --config.store-dir=/pnpm-store
 
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 # `--frozen-lockfile` is the point of the step: a build that silently resolves a different
@@ -56,10 +70,11 @@ WORKDIR /app
 # nothing at runtime needs them. No image toolchain either — there is no sharp, no ImageMagick and
 # no `sips`, because this service measures dimensions from the PNG header rather than resampling.
 # That is the whole reason its pipeline runs in CI when asset-forge's cannot.
-# `/runtime` comes across too: /app/node_modules holds @cloudsforge/* as symlinks into it,
-# so without the target the links dangle and the first `import '@cloudsforge/db'` fails at
-# run time.
+# `/runtime` and `/contracts` come across too: /app/node_modules holds @cloudsforge/* as symlinks
+# into them, so without the targets the links dangle and the first `import '@cloudsforge/db'` fails
+# at run time.
 COPY --from=build /runtime /runtime
+COPY --from=build /contracts /contracts
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/package.json ./package.json
 COPY --from=build /app/tsconfig.json /app/tsconfig.base.json ./
