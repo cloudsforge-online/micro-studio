@@ -1,6 +1,6 @@
 {
   "name": "@cloudsforge/studio",
-  "version": "2026.08.40",
+  "version": "2026.08.41",
   "private": true,
   "description": "Asset generation. Brand kits, asset specs, leased generation jobs and provenance-complete assets, generated through a reported image-backend chain with a per-account spend cap enforced before the call.",
   "license": "MIT",
