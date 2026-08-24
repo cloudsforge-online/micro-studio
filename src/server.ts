@@ -326,7 +326,25 @@ export function createServer(deps: ServerDeps): Server {
       return
     }
 
-    void handle(matched, { req, url, requestId, log, params, network }, forRequest(deps, network))
+    // studio holds no per-network database handle, so there is no `deps.sql.for()` here to
+    // refuse. `forRequest` can still throw — and an uncaught throw on this line is not a 500,
+    // it is an unhandled exception in a request listener, which exits the process. The try is
+    // what makes the failure answerable instead of fatal.
+    let scoped: ReturnType<typeof forRequest>
+    try {
+      scoped = forRequest(deps, network)
+    } catch (err) {
+      log.error('no usable dependencies for this request', { err, network })
+      send(
+        res,
+        errorReply(500, 'network_unavailable', 'this deployment cannot serve that network', requestId),
+        requestId,
+      )
+      finish(500, network)
+      return
+    }
+
+    void handle(matched, { req, url, requestId, log, params, network }, scoped)
       .then((reply) => {
         send(res, reply, requestId)
         finish(reply.status, network)
