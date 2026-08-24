@@ -21,7 +21,7 @@
  */
 
 import postgres from 'postgres'
-import { assertSchemaAtLeast, type Sql as DbSql } from '@cloudsforge/db'
+import { assertSchemaAtLeast, type Sql as DbSql , networkSql, type Sql as RuntimeSql } from '@cloudsforge/db'
 import { JobQueue, JobRunner, type Sql as JobsSql } from '@cloudsforge/jobs'
 import { Verifier } from '@cloudsforge/auth'
 import { Lifecycle, httpProbe, installSignalHandlers, postgresProbe } from '@cloudsforge/lifecycle'
@@ -69,12 +69,19 @@ logger.info('starting', {
 
 // 3. The database pool. Opened before the schema assertion for the obvious reason that the
 //    assertion is a query, and before the Lifecycle because the readiness probe closes over it.
-const sql = postgres(env.databaseUrl, {
+const poolOptions = {
   max: env.databasePoolMax,
   // postgres.js writes notices to stderr as unstructured text by default, which is how a
   // connection string ends up in a log the collector cannot parse.
   onnotice: () => {},
-})
+}
+const sql = postgres(env.databaseUrl, poolOptions)
+
+// ── ONE HANDLE PER NETWORK THIS DEPLOYMENT SERVES ────────────────────────────────────────────
+//
+// `STUDIO_DATABASE_URL_TESTNET` unset is the single-network case. `networkSql` then holds one
+// handle and REFUSES a testnet request rather than answering it out of mainnet rows.
+const sqlTestnet = env.databaseUrlTestnet ? postgres(env.databaseUrlTestnet, poolOptions) : undefined
 
 // 4. Assert the schema. This does **not** migrate — the migrator job does, and it has already run
 //    by the time a container starts. Failing here rather than serving is the point: a replica of
@@ -182,7 +189,11 @@ lifecycle
 // 8. The queue, before the routes: the generate route enqueues, so it closes over this.
 const queue = new JobQueue(sql as unknown as JobsSql, { owner: env.instanceId })
 
-const kits = postgresBrandKitStore(sql, SERVICE)
+// The factory, not just the store: `forRequest` in server.ts calls it again per request with the
+// handle for that request's network. studio keeps its handle inside the store, so the STORE is the
+// per-network thing.
+const kitsFor = (handle: unknown) => postgresBrandKitStore(handle as typeof sql, SERVICE)
+const kits = kitsFor(sql)
 const blobs = filesystemBlobStore(env.assetRoot, env.assetBaseUrl)
 
 const runDeps = {
@@ -215,6 +226,12 @@ const server = createServer({
   metrics,
   verifier,
   kits,
+  kitsFor,
+  sql: networkSql({
+    mainnet: sql as unknown as RuntimeSql,
+    ...(sqlTestnet ? { testnet: sqlTestnet as unknown as RuntimeSql } : {}),
+  }),
+  ...(env.singleNetwork ? { singleNetwork: env.singleNetwork as 'mainnet' | 'testnet' } : {}),
   reads: {
     findJob: (id) => findJob(sql, id),
     findAsset: (id) => findAsset(sql, id),
