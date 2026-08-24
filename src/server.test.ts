@@ -1,3 +1,4 @@
+import { networkSql, type Sql as RuntimeSql } from '@cloudsforge/db'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { chmod, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises'
@@ -308,6 +309,9 @@ async function withServer(options: Options, fn: (h: Harness) => Promise<void>): 
     metrics,
     verifier: options.verifier ?? workingVerifier(),
     kits,
+    kitsFor: () => kits,
+    sql: networkSql({ mainnet: {} as RuntimeSql }),
+    singleNetwork: 'mainnet' as const,
     reads,
     generation,
     uploads,

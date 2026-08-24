@@ -46,6 +46,8 @@ import {
 import type { Lifecycle } from '@cloudsforge/lifecycle'
 import { Metrics, newRequestId, type Logger } from '@cloudsforge/telemetry'
 import { ACCENT_PATTERN, BrandKitConflictError, type BrandKit, type BrandKitStore } from './brandkits.ts'
+import { NetworkUnknownError, requestNetwork, type Network } from '@cloudsforge/http'
+import type { NetworkSql } from '@cloudsforge/db'
 import { CreditCapError, usd } from './credits.ts'
 import { SpecError, specFor } from './specs.ts'
 import { isBackendChoice, type BackendChoice } from './backend.ts'
@@ -97,7 +99,22 @@ export interface ServerDeps {
   readonly logger: Logger
   readonly metrics: Metrics
   readonly verifier: PrincipalVerifier
+  /**
+   * The store for THIS REQUEST's network, rebuilt per request by `forRequest`.
+   *
+   * The boot-time value is a placeholder. studio never held a bare `sql`: its handle lives inside
+   * `postgresBrandKitStore(sql, …)`, so the thing that has to become per-network is the STORE, not
+   * a pool reference. Same shape as policy's snapshot reader.
+   */
   readonly kits: BrandKitStore
+  /**
+   * The per-network selector, and the factory that turns one into a store. A service whose data
+   * access is behind a store still has to choose the network before it builds one.
+   */
+  readonly sql: NetworkSql
+  readonly kitsFor: (sql: unknown) => BrandKitStore
+  /** `CF_NETWORK_SINGLE`, for `pnpm dev`, which has no gateway to stamp the header. */
+  readonly singleNetwork?: Network
   readonly reads: ReadModel
   readonly generation: GenerationRequester
   readonly uploads: UploadReceiver
@@ -186,12 +203,20 @@ interface Reply {
   readonly headers?: Record<string, string>
 }
 
+/**
+ * Routes that answer without belonging to a network — kubelet probes the first two and Prometheus
+ * scrapes the third, and none comes through the gateway, so none carries `CF-Network`.
+ */
+const OPERATIONAL_ROUTES: ReadonlySet<string> = new Set(['/livez', '/readyz', '/metrics'])
+
 interface RequestContext {
   readonly req: IncomingMessage
   readonly url: URL
   readonly requestId: string
   readonly log: Logger
   readonly params: Record<string, string>
+  /** The network this REQUEST belongs to, from the header the gateway stamped. */
+  readonly network: Network
 }
 
 interface Route {
@@ -266,24 +291,51 @@ export function createServer(deps: ServerDeps): Server {
     inFlight += 1
     deps.metrics.set('http_requests_in_flight', inFlight)
 
-    const finish = (status: number) => {
+    const finish = (status: number, metricNetwork: string) => {
       inFlight -= 1
       deps.metrics.set('http_requests_in_flight', inFlight)
       const durationMs = Number(process.hrtime.bigint() - startedAt) / 1e6
-      deps.metrics.increment('http_requests_total', { method, route: routeLabel, status: String(status) })
-      deps.metrics.observe('http_request_duration_ms', durationMs, { method, route: routeLabel })
+      deps.metrics.increment('http_requests_total', {
+        method,
+        route: routeLabel,
+        status: String(status),
+        network: metricNetwork,
+      })
+      deps.metrics.observe('http_request_duration_ms', durationMs, {
+        method,
+        route: routeLabel,
+        network: metricNetwork,
+      })
     }
 
-    void handle(matched, { req, url, requestId, log, params }, deps)
+    // The network first, then the STORE for it. `requestNetwork` refuses an unstamped request
+    // rather than assuming mainnet; the operational endpoints are exempt because kubelet and
+    // Prometheus never come through the gateway.
+    const networkless = matched !== undefined && OPERATIONAL_ROUTES.has(matched.path)
+    let network: Network
+    try {
+      network = networkless
+        ? (deps.singleNetwork ?? deps.sql.networks[0] ?? 'mainnet')
+        : requestNetwork(req.headers, deps.singleNetwork ? { fallback: deps.singleNetwork } : {})
+    } catch (err) {
+      log.error('request carries no usable network', {
+        err: err instanceof NetworkUnknownError ? err.message : err,
+      })
+      send(res, errorReply(500, 'network_unknown', 'this request could not be attributed to a network', requestId), requestId)
+      finish(500, 'unknown')
+      return
+    }
+
+    void handle(matched, { req, url, requestId, log, params, network }, forRequest(deps, network))
       .then((reply) => {
         send(res, reply, requestId)
-        finish(reply.status)
+        finish(reply.status, network)
       })
       .catch((err: unknown) => {
         // Reaching here means the error mapping itself failed. Answer, then say so loudly.
         log.error('request handler threw after mapping', { err })
         send(res, errorReply(500, 'internal', 'the request could not be completed', requestId), requestId)
-        finish(500)
+        finish(500, network)
       })
   })
 }
@@ -300,6 +352,17 @@ export function createServer(deps: ServerDeps): Server {
  *   * **409** — well formed, but a kit of that name already exists for this owner.
  *   * **503** — the token verifier could not be reached.
  */
+/**
+ * The deps a REQUEST sees: the store rebuilt against this request's network.
+ *
+ * studio keeps its handle inside the store, so the store is the thing to rebuild — `kitsFor` is the
+ * same factory `index.ts` uses at boot, called again with the right handle. Cheap: the store is a
+ * closure over a pool, not a connection.
+ */
+function forRequest(deps: ServerDeps, network: Network): ServerDeps {
+  return { ...deps, kits: deps.kitsFor(deps.sql.for(network)) }
+}
+
 async function handle(route: Route | undefined, ctx: RequestContext, deps: ServerDeps): Promise<Reply> {
   if (!route) {
     return errorReply(404, 'not_found', `no route for ${ctx.req.method} ${ctx.url.pathname}`, ctx.requestId)
